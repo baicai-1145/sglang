@@ -656,7 +656,13 @@ class DefaultModelLoader(BaseModelLoader):
                 )
                 use_multithread = False
 
-            if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+            if os.environ.get("KT_NPU_DISK_EXPERTS") == "1":
+                from disk_experts import resident_checkpoint_iterator
+                from sglang.srt.runtime_context import get_exec
+                weights_iterator = resident_checkpoint_iterator(
+                    hf_weights_files, get_exec().moe.kt_num_gpu_experts
+                )
+            elif self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,

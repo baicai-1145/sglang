@@ -5,6 +5,8 @@ scales. This module adapts those checkpoint weights to the shared Ascend MoE
 runner and A5 grouped-matmul kernels.
 """
 
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -44,10 +46,24 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         # ``None`` selects the full MX dynamic-quant defaults used by the
         # original DeepSeek-V4 path; the shared ModelSlim path keeps its
         # historical explicit ``dst_type`` behavior.
-        # TODO: Fuse DeepSeek-V4 W13 GMM + SwiGLU + MXFP8 requant with
-        # npu_grouped_matmul_swiglu_quant_v2 once it accepts swiglu_limit.
-        # V4 sets swiglu_limit=10.0; the current fused op implements only
-        # standard SwiGLU and would skip the required gate/up clamps.
+        # TODO: Fuse DeepSeek-V4 W13 GMM + SwiGLU + MXFP8 requant into one op.
+        # The blocker is NOT clamp support:
+        #   * npu_grouped_matmul_swiglu_quant_v2's A8W4 branch does call the plain
+        #     high-level SwiGLU with no clamp (verified in CANN 9.1 source,
+        #     ops_transformer/.../grouped_matmul_swiglu_quant_v2_a8w4_msd_post.h),
+        #     so it cannot serve V4's swiglu_limit=10.0 as-is; BUT
+        #   * npu_swiglu_group_quant -- the activation op this path already runs
+        #     today (torch.ops.npu.swiglu_group_quant) -- DOES implement the exact
+        #     V4 clamp semantics
+        #     (Mins(gate, limit); Maxs/Min(up, +-limit); see
+        #     ops_nn/ascendc/swiglu_group_quant/arch35/swiglu_group_quant_base.h),
+        #     matching NPUSwigluMxfp8Quant in moe/activation.py.
+        # The real blocker is the quantization combination: v2 branches on
+        # (x, weight, x_scale) dtypes and its fully-quantized MX arm wants an
+        # already-quantized --x_scale, whereas V4 runs gmm1 as FP8 activation x
+        # INT8-packed FP4 weight with the activation NOT pre-quantized (this
+        # path quantizes it in w4a8_mxfp_gmm). Reaching a single fused kernel
+        # therefore needs an interface/precision change, not one more flag.
         self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
         self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
         self.runner = None
@@ -170,11 +186,22 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
+            from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
+
+            single_token_mx = (
+                isinstance(layer.dispatcher, AscendTPDispatcher)
+                and os.environ.get("KT_NPU_FP4_ROUTING_MX", "0") == "1"
+            )
             layer.dispatcher.set_quant_config(
                 {
                     "normal_dispatcher_output_dtype": "bf16",
                     "low_latency_dispatcher_output_dtype": "mxfp8",
+                    "single_token_mxfp8": single_token_mx,
                 }
+            )
+            logging.getLogger(__name__).info(
+                "FP4 routing %s: dispatcher=%s single_token_mxfp8=%s",
+                self.prefix, type(layer.dispatcher).__name__, single_token_mx,
             )
 
     def apply(self, layer: torch.nn.Module, dispatch_output: "DispatchOutput"):

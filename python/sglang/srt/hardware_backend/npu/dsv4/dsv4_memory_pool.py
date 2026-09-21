@@ -578,6 +578,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
+        import os
+        if os.environ.get("KT_NPU_CHECK_CACHE_BOUNDS") == "1":
+            torch.npu.synchronize()
+            host_slots = slot_mapping.cpu().long()
+            rows = buf.numel() // buf.shape[-1]
+            if ((host_slots < -1) | (host_slots >= rows)).any():
+                raise ValueError(f"KV writer out-of-bounds slots: min={host_slots.min().item()} max={host_slots.max().item()} capacity={rows}")
         torch.ops.npu.kv_compress_epilog(
             buf.view(-1, 1, buf.shape[-1]),
             cache_2d,
@@ -587,6 +594,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             round_scale_flag=True,
             layout=1,
         )
+        # Local ops-transformer attention ABI uses BF16 scale values, whereas
+        # the sgl epilog emits E8M0 bytes. Explicit deployment compatibility gate.
+        import os
+        if os.environ.get("KT_NPU_KV_BF16_SCALE_ABI") in ("1", "2"):
+            from a5_kv_compat import convert_written_scales_
+            convert_written_scales_(buf, slot_mapping)
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,

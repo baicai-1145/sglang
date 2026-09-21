@@ -134,6 +134,52 @@ class HashTopK(nn.Module):
             return topk_output
         return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
+    def _forward_npu(
+        self, router_logits: torch.Tensor, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Hash routing through the NPU fused gating op.
+
+        ``custom.npu_moe_gating_top_k`` takes optional ``input_ids``/``tid2eid``
+        and then selects the routed experts by hash (``tid2eid[input_ids]``)
+        instead of by value. It fuses softplus+sqrt+hash-gather+renorm+cast, which
+        is exactly ``_forward_torch``'s hash path, so the three hash layers no
+        longer need the ``SGLANG_OPT_USE_FUSED_HASH_TOPK=0`` exemption (that env
+        guards a CUDA JIT kernel and is unavailable on NPU).
+
+        Number of routed experts is ``self.tid2eid.shape[1]``; the op fills
+        exactly that many columns. ``num_fused_shared_experts`` must be 0: the
+        fused op has no slot for a shared expert whose weight is the routed sum
+        rescaled by ``routed_scaling_factor`` -- that behaviour exists only in the
+        torch reference path.
+
+        The op normalises after gathering with ``sum + eps`` and then multiplies by
+        ``routedScalingFactor``, matching ``_forward_torch`` except for the last
+        step; we therefore pass ``routed_scaling_factor=1.0`` and let ``forward``
+        apply the scaling through ``apply_routed_scaling_factor_on_output``, so
+        both paths scale in the same place.
+
+        Note: ``custom.npu_moe_gating_top_k`` is the same op the non-hash sqrtsoftplus
+        path already calls (``npu/moe/topk.py :: fused_topk_npu``), so the schema
+        name is confirmed to resolve on this stack; the C++ entry point is
+        ``aclnnMoeGatingTopKHash``.
+        """
+        if self.num_fused_shared_experts != 0:
+            raise NotImplementedError(
+                "NPU fused hash gating does not implement the fused shared-expert "
+                "slot; run with --disable-shared-experts-fusion."
+            )
+        topk_routed = self.tid2eid.shape[1]
+        topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+            x=router_logits.to(torch.float32),
+            k=topk_routed,
+            input_ids=input_ids,
+            tid2eid=self.tid2eid,
+            norm_type=2,  # sqrtsoftplus: sqrt(softplus(x))
+            eps=_RENORMALIZE_SUM_EPSILON,
+            routed_scaling_factor=1.0,
+        )
+        return topk_weights.to(torch.float32), topk_ids
+
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -231,6 +277,17 @@ class HashTopK(nn.Module):
 
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
+        elif (
+            _is_npu
+            and self.score_func == "sqrtsoftplus"
+            and envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get()
+        ):
+            # NPU has no nvcc, so the fused implementation here is the CANN custom
+            # op instead of the CUDA JIT kernel used by the branch below. Gated on
+            # the same env var so one knob selects "fused hash topk" on both
+            # backends, and setting it to 0 still forces the torch fallback
+            # (i.e. it doubles as the rollback switch).
+            topk_weights, topk_ids = self._forward_npu(router_logits, input_ids)
         elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.kernels.ops.attention.dsv4 import hash_topk
 

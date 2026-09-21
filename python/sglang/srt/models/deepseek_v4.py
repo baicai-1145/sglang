@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -1017,6 +1018,36 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
+        # Experimental Q-tail fusion: explicit layer selection, default off.
+        qrope_layers = os.environ.get("KT_NPU_QNORM_ROPE_LAYERS", "1").split(",")
+        self._npu_qnorm_rope = (
+            _is_npu
+            and os.environ.get("KT_NPU_QNORM_ROPE", "0") == "1"
+            and ("all" in qrope_layers or str(self.layer_id) in qrope_layers)
+            and self.n_local_heads == 64
+            and self.head_dim == 512
+            and self.qk_nope_head_dim == 448
+        )
+        self._npu_qrope_only = (
+            _is_npu
+            and os.environ.get("KT_NPU_QROPE_ONLY", "0") == "1"
+            and ("all" in qrope_layers or str(self.layer_id) in qrope_layers)
+            and self.n_local_heads == 64
+            and self.head_dim == 512
+            and self.qk_nope_head_dim == 448
+        )
+        self._npu_qrope_group = int(os.environ.get("KT_NPU_QROPE_GROUP", "4")) if self._npu_qrope_only else 4
+        if self._npu_qrope_group not in (1, 4, 8, 16):
+            raise ValueError("KT_NPU_QROPE_GROUP must be 1, 4, 8 or 16")
+        if self._npu_qnorm_rope or self._npu_qrope_only:
+            logger.info("Experimental Q tail fusion enabled for layer %s (norm_rope=%s rope_only=%s)", self.layer_id, self._npu_qnorm_rope, self._npu_qrope_only)
+        self._npu_fused_qnorm_mx = (
+            _is_npu
+            and self.use_npu_arch35_mxfp8_wo_a
+            and self.attn_tp_size == 1
+            and self.indexer is None
+            and os.environ.get("KT_NPU_FUSED_QNORM_MX") == "1"
+        )
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
@@ -1216,6 +1247,18 @@ class MQALayer(MqaAttentionBase):
         # indexer/compressor on current. rope is split; the kv-only call passes
         # kv.unsqueeze(1) as q_rope so the op sees [T,1,1,head_dim] like the
         # fused path.
+        #
+        # DO NOT move the core compressor to a side stream here. A
+        # KT_NPU_COMPRESSOR_SIDE_STREAM experiment (2026-09-21) did exactly that,
+        # mirroring the CUDA/ROCm prepare paths, and it produced CORRUPT output:
+        # every request emitted only 2 non-zero token ids then zeros
+        # (output_ids [9544, 734, 0, 0, ...] vs the correct text), while the
+        # throughput looked unchanged (~65.37 tok/s). The serialisation below is
+        # deliberate, not an oversight: `self.indexer(...)` runs the indexer's own
+        # compressor on this stream, and forward_core_compressor -> *_ensure_fused_caches
+        # / _ensure_compressor_hadamard lazily build shared compressor state. Running
+        # the two concurrently races on that state. Keeping both on `current` is
+        # required for correctness on this backend.
         assert self.alt_streams is not None
         current_stream = torch.npu.current_stream()
         stream_kv = self.alt_streams[0]
@@ -1226,14 +1269,32 @@ class MQALayer(MqaAttentionBase):
         x_linear = x_quant if x_quant is not None else x
         qkv_a: Optional[torch.Tensor] = None
         qkv_a_ready = None
-        if self.fuse_wqa_wkv:
+        if x_quant is not None:
+            # Native MX scales must not go through the linear backend, which
+            # unconditionally quantizes its input again.
+            assert self.fuse_wqa_wkv and self.attn_tp_size == 1
+            assert self.layer_id in (0, 1, 2, 3, 42) and x.shape == (1, 4096)
+            if self.layer_id in (0, 1):
+                assert self.indexer is None and self.compressor is None
+            assert forward_batch.forward_mode.is_decode_or_idle()
+            assert self.wqkv_a.bias is None
+            qkv_a = torch_npu.npu_quant_matmul(
+                x_quant[0], self.wqkv_a.weight, self.wqkv_a.weight_scale_inv,
+                scale_dtype=torch.float8_e8m0fnu,
+                pertoken_scale=x_quant[1],
+                pertoken_scale_dtype=torch.float8_e8m0fnu,
+                output_dtype=torch.bfloat16, group_sizes=(1, 1, 32),
+            )
+            qkv_a_ready = current_stream.record_event()
+        elif self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             qkv_a_ready = current_stream.record_event()
         if qkv_a is not None:
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
-        q_lora = self.q_norm(q_lora)
+        if not self._npu_fused_qnorm_mx:
+            q_lora = self.q_norm(q_lora)
         q_lora_ready = current_stream.record_event()
 
         # KV block on stream_kv.
@@ -1264,24 +1325,54 @@ class MQALayer(MqaAttentionBase):
         # Q block on stream_q (needs only q_lora).
         with torch.npu.stream(stream_q):
             stream_q.wait_event(q_lora_ready)
-            q, _ = self.wq_b(q_lora)
+            if self._npu_fused_qnorm_mx:
+                from npu_norm_quant_compat import rms_mxfp8_linear
+                q = rms_mxfp8_linear(
+                    q_lora, self.q_norm.weight, self.eps,
+                    self.wq_b.weight, self.wq_b.weight_scale_inv,
+                )
+            else:
+                q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            use_qrope = (
+                self._npu_qnorm_rope
+                and not self._npu_qrope_only
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and q.shape[0] == 1
+                and q.dtype == torch.bfloat16
+                and q.is_contiguous()
+            )
+            if not use_qrope:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
             )
-            Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                q,
-                None,
-                cos4_q,
-                sin4_q,
-                qk_nope_dim=self.qk_nope_head_dim,
-            )
+            if use_qrope:
+                from npu_qnorm_rope import qnorm_rope
+                q = qnorm_rope(q, cos4_q, sin4_q, self.eps)
+            elif (
+                self._npu_qrope_only
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and q.shape[0] == 1
+                and q.dtype == torch.bfloat16
+                and q.is_contiguous()
+            ):
+                from npu_qnorm_rope import qrope_only
+                qrope_only(q, cos4_q, sin4_q, self._npu_qrope_group)
+            else:
+                Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                    q,
+                    None,
+                    cos4_q,
+                    sin4_q,
+                    qk_nope_dim=self.qk_nope_head_dim,
+                )
             if q_out is not None:
                 q_out.copy_(q)
             q.record_stream(stream_q)
 
-        # Indexer + compressor: serial on current.
+        # Indexer + compressor: serial on current (see the comment above -- moving
+        # the core compressor to a side stream corrupts output).
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1902,6 +1993,24 @@ class MQALayer(MqaAttentionBase):
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
 
+        import os
+        attention_detail = (
+            _is_npu and self.layer_id == (31 if os.environ.get("KT_NPU_ATTN_LAYER31_DIAG") == "1" else (20 if os.environ.get("KT_NPU_ATTN_LAYER20_DIAG") == "1" else 12))
+            and forward_batch.forward_mode.is_prefill()
+            and not forward_batch.forward_mode.is_target_verify()
+            and os.environ.get("KT_NPU_ATTN_DETAIL_DIAG") == "1"
+            and os.environ.get("KT_NPU_C4_UPSTREAM_DIAG")
+        )
+        if attention_detail:
+            from npu_c4_upstream_diagnostic import snapshot as attention_snapshot
+            attention_snapshot(self.layer_id, "prepared_q", q, positions, forward_batch)
+            if kv is not None:
+                attention_snapshot(self.layer_id, "prepared_kv", kv, positions, forward_batch)
+            if self.compress_ratio == 4:
+                attention_snapshot(self.layer_id, "indexer_topk",
+                                   attn_backend.forward_metadata.c4_topk_indices,
+                                   positions, forward_batch)
+
         if unified:
             # only the HIP radix backend takes these two; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -1950,6 +2059,11 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        if attention_detail:
+            attention_snapshot(self.layer_id, "sparse_attention_output", o, positions, forward_batch)
+        if os.environ.get("KT_NPU_DIAG_PATH") and self.layer_id == 0:
+            from diagnose_forward import snapshot
+            snapshot("layer0-attention", q=q, kv=kv, output=o)
         if (
             _FP8_WO_A_GEMM
             and _wo_a_fp8_mxscale_fused_invrope is not None
@@ -1992,8 +2106,12 @@ class MQALayer(MqaAttentionBase):
                 )
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
+            if attention_detail:
+                attention_snapshot(self.layer_id, "inverse_rope_output", o, positions, forward_batch)
 
             if self.use_npu_arch35_mxfp8_wo_a:
+                if os.environ.get("KT_NPU_DIAG_PATH") and self.layer_id == 0:
+                    snapshot("layer0-wo-a-input", x=o, weight=self.wo_a.weight, scale=self.wo_a.weight_scale_inv)
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
                     o, dst_type=torch.float8_e4m3fn
                 )
@@ -2009,6 +2127,10 @@ class MQALayer(MqaAttentionBase):
                     perm_x2=(0, 1, 2),
                     perm_y=(1, 0, 2),
                 )
+                if attention_detail:
+                    attention_snapshot(self.layer_id, "wo_a_output", o, positions, forward_batch)
+                if os.environ.get("KT_NPU_DIAG_PATH") and self.layer_id == 0:
+                    snapshot("layer0-wo-a-output", output=o)
             elif _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
                 # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
@@ -2158,6 +2280,58 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+        self._npu_input_norm_mx = (
+            _is_npu
+            and is_npu_arch35()
+            and os.environ.get("KT_NPU_INPUT_NORM_MX", "0") == "1"
+            and self.layer_id in (0, 1)
+            and self.self_attn.attn_tp_size == 1
+            and self.self_attn.fuse_wqa_wkv
+            and self.self_attn.compressor is None
+            and self.self_attn.indexer is None
+        )
+        if self._npu_input_norm_mx:
+            logger.info("Experimental input RMSNorm+MX enabled for layer %s", self.layer_id)
+        self._npu_input_norm_mx_preserve = (
+            _is_npu
+            and is_npu_arch35()
+            and os.environ.get("KT_NPU_INPUT_NORM_MX_PRESERVE", "0") == "1"
+            and self.layer_id in (2, 3, 42)
+            and self.self_attn.attn_tp_size == 1
+            and self.self_attn.fuse_wqa_wkv
+        )
+        if self._npu_input_norm_mx_preserve:
+            logger.info("Experimental input RMSNorm+MX preserve enabled for layer %s", self.layer_id)
+
+    def _input_norm_with_optional_mx(self, hidden_states, forward_batch):
+        # No BF16 normalized output is available from the native fused op.
+        # Only compressor/indexer-free, single-rank decode may omit it.
+        if (
+            (self._npu_input_norm_mx or self._npu_input_norm_mx_preserve)
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and self.self_attn.alt_streams is not None
+            and self.self_attn._multi_stream_bs_limit >= 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and hidden_states.shape == (1, 4096)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and self.input_layernorm.weight.dtype == torch.bfloat16
+            and self.self_attn.wqkv_a.weight.dtype == torch.float8_e4m3fn
+        ):
+            # Preserve the original BF16 consumer value in compressed layers.
+            # Fused quantization independently repeats Norm on the raw input.
+            normalized = (
+                self.input_layernorm(hidden_states)
+                if self._npu_input_norm_mx_preserve else hidden_states
+            )
+            q, scales, _ = torch_npu.npu_rms_norm_dynamic_mx_quant(
+                hidden_states, self.input_layernorm.weight,
+                epsilon=self.input_layernorm.variance_epsilon,
+                dst_type=292, scale_alg=0, round_mode="rint",
+            )
+            # Only compressor/indexer-free layers may retain raw shape storage.
+            return normalized, (q, scales)
+        return self.input_layernorm(hidden_states), None
 
     def _build_self_attn(
         self,
@@ -2211,6 +2385,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
+            if os.environ.get("KT_NPU_HC_CAPACITY_DIAG") == "1":
+                from npu_hc_capacity_diagnostic import run as run_hc_capacity_diagnostic
+                diagnostic = run_hc_capacity_diagnostic(
+                    self.layer_id, _get_mhc_ops().npu_hc_pre, x, hc_fn, hc_scale, hc_base,
+                    hc_mult=self.hc_mult, hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                    rms_norm_eps=self.rms_norm_eps, hc_eps=self.hc_eps,
+                    forward_batch=forward_batch,
+                )
+                if diagnostic is not None:
+                    return diagnostic
             return _get_mhc_ops().npu_hc_pre(
                 x,
                 hc_fn,
@@ -2422,6 +2606,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        upstream_diag = bool(os.environ.get("KT_NPU_C4_UPSTREAM_DIAG")) and _is_npu
+        if upstream_diag:
+            from npu_c4_upstream_diagnostic import snapshot
+            snapshot(self.layer_id, "layer_input", hidden_states, positions, forward_batch)
 
         if prev_residual is not None and use_fused:
             # Dispatch cascade: aiter HIP (gfx95) -> Triton (gfx95 small-batch
@@ -2508,11 +2696,18 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.rms_norm_eps,
                     )
                 else:
-                    hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+                    hidden_states, x_quant = self._input_norm_with_optional_mx(
+                        hidden_states, forward_batch
+                    )
             else:
                 x_quant = None
 
+        if upstream_diag:
+            from npu_c4_upstream_diagnostic import weights_once
+            weights_once(self, positions, forward_batch)
+            snapshot(self.layer_id, "attention_input", hidden_states, positions, forward_batch)
+            snapshot(self.layer_id, "attention_post", post, positions, forward_batch)
+            snapshot(self.layer_id, "attention_comb", comb, positions, forward_batch)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -2520,6 +2715,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 x_quant=x_quant,
             )
+        if upstream_diag:
+            snapshot(self.layer_id, "attention_output", hidden_states, positions, forward_batch)
 
         if use_fused:
             post_attn_norm_weight = (
@@ -2563,6 +2760,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     hidden_states = self.post_attention_layernorm(hidden_states)
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if upstream_diag:
+                snapshot(self.layer_id, "ffn_residual", hidden_states, positions, forward_batch)
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -2572,18 +2771,42 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.post_attention_layernorm,
                 forward_batch=forward_batch,
             )
+            if upstream_diag:
+                snapshot(self.layer_id, "ffn_prenorm", hidden_states, positions, forward_batch)
+                snapshot(self.layer_id, "ffn_post", post, positions, forward_batch)
+                snapshot(self.layer_id, "ffn_comb", comb, positions, forward_batch)
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self._run_moe_ffn_dp_sync(
-            hidden_states,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
+        if upstream_diag:
+            snapshot(self.layer_id, "mlp_input", hidden_states, positions, forward_batch)
+        if _is_npu and (
+            os.environ.get("KT_NPU_MOE_LANDMARK_DIAG")
+            or os.environ.get("KT_NPU_GATE_CAPACITY_DIAG") == "1"
+        ):
+            from npu_gate_capacity_diagnostic import capture as gate_capacity_context
+            from npu_moe_landmark_diagnostic import capture as capture_moe_landmarks
+            with gate_capacity_context(self, forward_batch):
+                with (capture_moe_landmarks(self, positions, forward_batch)
+                      if os.environ.get("KT_NPU_MOE_LANDMARK_DIAG") else nullcontext()):
+                    hidden_states = self._run_moe_ffn_dp_sync(
+                        hidden_states, forward_batch, input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                    )
+        else:
+            hidden_states = self._run_moe_ffn_dp_sync(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
 
+        if upstream_diag:
+            snapshot(self.layer_id, "mlp_output", hidden_states, positions, forward_batch)
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if upstream_diag:
+                snapshot(self.layer_id, "layer_output", hidden_states, positions, forward_batch)
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -2782,8 +3005,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                 )
             else:
-                hidden_states = self.input_layernorm(hidden_states)
-                x_quant = None
+                hidden_states, x_quant = self._input_norm_with_optional_mx(
+                    hidden_states, forward_batch
+                )
         else:
             x_quant = None
 
@@ -4080,6 +4304,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        import os
+        if os.environ.get("KT_NPU_DIAG_PATH"):
+            from diagnose_forward import install
+            install(self)
 
         if not is_nextn:
             self._prewarm_mhc_kernels()

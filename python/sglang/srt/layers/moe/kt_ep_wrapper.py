@@ -7,7 +7,8 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -19,7 +20,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -110,8 +111,7 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     Returns:
         Modified topk_ids tensor with CPU expert IDs masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    return topk_ids.masked_fill(topk_ids >= num_gpu_experts, -1)
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -155,6 +155,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_parallel().tp_rank
+        self.is_npu = is_npu()
+        self.disk_offload = self.is_npu and os.environ.get("KT_NPU_DISK_EXPERTS") == "1"
+        self.disk_engine = None
+        if self.disk_offload:
+            from sglang.srt.runtime_context import get_spec
+            if get_spec().speculative_algorithm is not None:
+                raise ValueError("Native disk expert baseline does not support speculative decoding/MTP")
+        self.npu_dispatcher = None
+        if self.is_npu:
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+            from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+                NPUW4A8MXFP4FusedMoEMethod,
+            )
+            if (get_parallel().tp_size != 1 or get_parallel().moe_ep_size != 1
+                    or not get_moe_a2a_backend().is_none()):
+                raise ValueError("KT native FP4 on NPU currently requires TP=EP=1 and no A2A")
+            if kt_config.method != "MXFP4" or not isinstance(gpu_method, NPUW4A8MXFP4FusedMoEMethod):
+                raise ValueError("KT NPU bring-up supports native MXFP4 experts only")
+            if self.num_gpu_experts <= 0:
+                raise ValueError("KT NPU bring-up requires at least one resident expert")
+            if get_exec().moe.enable_eplb:
+                raise ValueError("KT native FP4 NPU does not support EPLB")
+            if kt_config.max_deferred_experts_per_token:
+                raise ValueError("KT NPU bring-up does not support deferred experts")
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
@@ -182,6 +206,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs: Additional weight attributes
         """
         self.global_num_experts = num_experts
+        if self.is_npu and getattr(layer.moe_runner_config, "num_fused_shared_experts", 0):
+            raise ValueError("KT native FP4 NPU does not support fused shared experts")
+        if self.is_npu and self.num_gpu_experts >= num_experts:
+            raise ValueError("KT NPU requires fewer resident experts than total experts")
+        cpu_kwargs = {}
+        if self.is_npu:
+            # Current KT inference API uses a mask; num_gpu_experts is SFT-only.
+            cpu_kwargs = {
+                "gpu_experts_mask": torch.arange(num_experts, device="cpu") < self.num_gpu_experts,
+                "swiglu_limit": float(layer.moe_runner_config.swiglu_limit or 0.0),
+            }
+        else:
+            cpu_kwargs = {"num_gpu_experts": self.num_gpu_experts}
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size_per_partition
 
@@ -215,14 +252,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
-        if self.tp_rank == 0:
+        if self.disk_offload:
+            from resident_policy import resident_ids
+            ids = resident_ids(self.kt_config.layer_idx, self.num_gpu_experts, num_experts)
+            self.resident_slot_by_id = {expert: slot for slot, expert in enumerate(ids)}
+            self.logical_to_resident = torch.full((num_experts,), -1, dtype=torch.int64, device=layer.w13_weight.device)
+            self.logical_to_resident[torch.tensor(ids, device=layer.w13_weight.device)] = torch.arange(self.num_gpu_experts, device=layer.w13_weight.device)
+            from disk_experts import StreamingFP4Experts, shared_disk_store
+            self.disk_engine = StreamingFP4Experts(
+                shared_disk_store(self.kt_config.weight_path),
+                layer=self.kt_config.layer_idx, num_experts=num_experts,
+                device=str(layer.w13_weight.device),
+                swiglu_limit=float(layer.moe_runner_config.swiglu_limit or 0.0),
+                num_layers=self.kt_config.num_layers or 43,
+                num_resident=self.num_gpu_experts,
+            )
+        elif self.tp_rank == 0:
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                **cpu_kwargs,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
@@ -237,24 +289,39 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             layer: The MoE layer module
         """
+        if self.is_npu:
+            from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None:
+                mapping = metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx].reshape(-1)
+                identity = torch.arange(self.global_num_experts, device="cpu", dtype=mapping.dtype)
+                if mapping.shape != identity.shape or not torch.equal(mapping.cpu(), identity):
+                    raise ValueError("KT native FP4 NPU requires identity expert placement (no EPLB)")
+            for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                scale = getattr(layer, name)
+                if (scale.reshape(self.num_gpu_experts, -1).amax(dim=1) == 0).any().item():
+                    raise ValueError(f"Unloaded resident expert scales in {name}")
         # 1. Process GPU weights
         if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
-            torch.cuda.synchronize()
+            if self.is_npu:
+                torch.npu.synchronize()
+            else:
+                torch.cuda.synchronize()
 
             # Get expert location metadata for CPU expert mapping
             from sglang.srt.eplb.expert_location_dispatch import (
                 get_global_expert_location_metadata,
             )
 
-            physical_to_logical_map_cpu = (
-                get_global_expert_location_metadata()
-                .physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                .contiguous()
-            )
+            metadata = get_global_expert_location_metadata()
+            if self.is_npu and metadata is None:
+                physical_to_logical_map_cpu = torch.arange(self.global_num_experts, dtype=torch.int64)
+            else:
+                physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx].contiguous()
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
@@ -271,6 +338,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             moe_runner_config.num_local_experts = self.num_gpu_experts
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        if self.is_npu:
+            from sglang.srt.layers.moe.token_dispatcher import AscendTPDispatcher
+            resident_config = replace(moe_runner_config, num_experts=self.num_gpu_experts)
+            self.npu_dispatcher = AscendTPDispatcher(resident_config)
+            self.npu_dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
     def submit(
         self,
@@ -299,7 +371,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+            x, topk_ids, topk_weights,
+            (torch.npu.current_stream(x.device).npu_stream if self.is_npu
+             else torch.cuda.current_stream(x.device).cuda_stream)
         )
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
@@ -318,7 +392,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Wait for CPU computation and retrieve results
         return self.wrapper.sync_forward(
-            x, torch.cuda.current_stream(x.device).cuda_stream
+            x, (torch.npu.current_stream(x.device).npu_stream if self.is_npu
+                else torch.cuda.current_stream(x.device).cuda_stream)
         )
 
     def apply(
@@ -345,6 +420,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
+        if self.is_npu and torch.npu.is_current_stream_capturing():
+            raise RuntimeError("KT native FP4 NPU baseline requires graphs disabled")
+        if self.is_npu and x.shape[0] == 0:
+            return StandardCombineInput(hidden_states=torch.zeros_like(x))
+
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
@@ -352,21 +432,51 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+        if self.disk_offload:
+            masked_topk_ids = self.logical_to_resident[topk_ids.clamp_min(0).long()].masked_fill(topk_ids < 0, -1).to(topk_ids.dtype)
+        else:
+            masked_topk_ids = (
+                topk_ids.masked_fill(topk_ids >= self.num_gpu_experts, -1)
+                if self.is_npu else mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+            )
 
         # Create modified dispatch output for GPU computation
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+        if self.is_npu:
+            masked_topk_output = masked_topk_output._replace(
+                topk_weights=topk_output.topk_weights.masked_fill(masked_topk_ids < 0, 0)
+            )
         masked_dispatch_output = dispatch_output._replace(
             topk_output=masked_topk_output
         )
 
         # Step 3: Execute GPU expert computation (any quantization method)
         # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        if self.is_npu:
+            if x.shape[0] == 0 or not (masked_topk_ids >= 0).any().item():
+                output = torch.zeros_like(x)
+            else:
+                resident_dispatch = self.npu_dispatcher.dispatch(x, masked_topk_output)
+                resident_combine = self.gpu_method.apply(layer, resident_dispatch)
+                # Routing allocates tokens*top_k rows, but GMM writes only sum(counts).
+                # Invalid routes can reference the uninitialized tail in finalize.
+                # Zero both their weights and their output (NaN * 0 is still NaN).
+                active_rows = int(resident_dispatch.expert_tokens.sum().item())
+                resident_combine.hidden_states[active_rows:].zero_()
+                output = self.npu_dispatcher.combine(resident_combine)
+        else:
+            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            output = gpu_combine_input.hidden_states
 
         # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
-        if self.tp_rank == 0:
+        if self.disk_offload:
+            if os.environ.get("KT_NPU_DISK_STATS_PATH"):
+                ids_cpu = topk_ids.detach().to(device="cpu", dtype=torch.int64)
+                self.disk_engine.all_route_counts += torch.bincount(ids_cpu[ids_cpu >= 0], minlength=self.global_num_experts)
+            cold_ids = topk_ids.masked_fill(masked_topk_ids >= 0, -1)
+            cold_output = self.disk_engine.forward(x, cold_ids, topk_output.topk_weights)
+            output = output + cold_output
+        elif self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
 

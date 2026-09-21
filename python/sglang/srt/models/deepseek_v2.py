@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -262,7 +263,10 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
-
+        # Cached lazily: reading os.environ on every forward would sit in the hot
+        # path, and the value is fixed for the life of the process (the NPU graph
+        # capture bakes the branch in anyway, so a runtime flip has no effect).
+        self._swiglu_mx_quant_cached: Optional[bool] = None
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -298,6 +302,28 @@ class DeepseekV2MLP(nn.Module):
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
+
+    def _swiglu_mx_quant_enabled(self) -> bool:
+        """Opt-in gate for the fused SwiGLU + MXFP8 quant path (default off).
+
+        Requires the MXFP8 linear method on down_proj, since only that method
+        accepts an already-quantized ``(qx, scale)`` activation tuple. If the
+        weights are not MXFP8 the plain ClippedSwiglu path stays in use, so the
+        flag is safe to set unconditionally.
+        """
+        if self._swiglu_mx_quant_cached is None:
+            enabled = os.environ.get("KT_NPU_FUSED_SWIGLU_MX_QUANT") == "1"
+            if enabled:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUMXFP8LinearMethod,
+                )
+
+                enabled = isinstance(
+                    getattr(self.down_proj, "quant_method", None),
+                    NPUMXFP8LinearMethod,
+                )
+            self._swiglu_mx_quant_cached = enabled
+        return self._swiglu_mx_quant_cached
 
     def forward(
         self,
@@ -435,6 +461,43 @@ class DeepseekV2MLP(nn.Module):
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
             if _is_npu:
+                # Opt-in fusion: npu_swiglu_mx_quant emits the SwiGLU result AND its
+                # MXFP8 block-32 activation scale in one kernel, so down_proj can
+                # skip its own npu_dynamic_mx_quant. NPUMXFP8LinearMethod already
+                # accepts a pre-quantized ``(qx, scale)`` tuple (the MLAProlog path
+                # uses it), which is why this needs no GEMM changes.
+                #
+                # Gated on an env var because it is NOT numerically identical to
+                # ClippedSwiglu + DynamicMxQuant: the fused op quantizes from its
+                # fp32 registers whereas the two-step path quantizes the bf16
+                # ClippedSwiglu output. Measured (reports/quant-fusion.md section 5):
+                # ~94.4% of dequantized activations are bit-identical, ~11% of MX
+                # blocks get a different E8M0 exponent, mean |delta| 0.33% of absmax.
+                # E8M0 is a power of two, so one exponent step rescales a block 2x --
+                # this is coarser than "one ulp", hence the tolerance + greedy
+                # acceptance requirement before enabling.
+                if (
+                    self._swiglu_mx_quant_enabled()
+                    and gate_up.is_contiguous()
+                ):
+                    qx, qscale = torch.ops.npu.npu_swiglu_mx_quant(
+                        gate_up,
+                        activate_dim=-1,
+                        activate_left=True,
+                        swiglu_mode=0,
+                        clamp_limit=float(self.swiglu_limit),
+                        glu_alpha=1.0,
+                        glu_bias=0.0,
+                        axis=-1,
+                        # 292 == float8_e4m3fn in the op's ge::DataType code
+                        # space; verified against a working probe (296 is NOT
+                        # the fp8 code and made the op fail).
+                        dst_type=292,
+                        round_mode="rint",
+                        scale_alg=0,
+                    )
+                    x, _ = self.down_proj((qx, qscale))
+                    return x
                 x = torch.ops.npu.npu_clipped_swiglu(
                     gate_up,
                     alpha=1,

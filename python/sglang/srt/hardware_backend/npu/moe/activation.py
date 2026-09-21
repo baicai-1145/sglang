@@ -1,3 +1,5 @@
+import os
+
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple
 
@@ -219,6 +221,17 @@ class NPUSwigluMxfp8Quant(BaseActivation):
             raise ValueError(
                 "swiglu_group_quant takes a per-expert count group list, got "
                 f"group_list_type={group_list_type}"
+            )
+        if os.environ.get("KT_NPU_UNFUSED_SWIGLU") == "1":
+            # Explicit bring-up mode when the custom fused op is unavailable.
+            # Do not use silu(gate).clamp(): V4 clamps BEFORE SiLU, upper-only.
+            gate, up = hidden_states.float().chunk(2, dim=-1)
+            gate = gate.clamp(max=self._limit)
+            up = up.clamp(min=-self._limit, max=self._limit)
+            activated = (F.silu(gate) * up).to(torch.bfloat16)
+            return torch.ops.npu.npu_dynamic_mx_quant(
+                activated, axis=-1, round_mode="rint",
+                dst_type=torch.float8_e4m3fn, block_size=32,
             )
         out, scale, _ = torch.ops.npu.swiglu_group_quant(
             x=hidden_states,

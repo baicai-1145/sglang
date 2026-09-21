@@ -56,6 +56,7 @@ class AscendTPDispatcher(BaseDispatcher):
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
+        self._single_token_mx_init = None
 
         # Initialise routing kernels with default (no quant config yet)
         self.set_ascend_dispatcher_output_dtype()
@@ -63,6 +64,12 @@ class AscendTPDispatcher(BaseDispatcher):
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         self.set_ascend_dispatcher_output_dtype()
+        # Opt-in FP4 single-token route. Other shapes keep their original ABI.
+        self._single_token_mx_init = (
+            NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
+            if quant_config.get("single_token_mxfp8", False)
+            else None
+        )
 
         # If the quantisation is GGUF and TP is active, wrap the finalizer
         # with an all‑gather so that the dispatcher stays completely clean.
@@ -102,12 +109,25 @@ class AscendTPDispatcher(BaseDispatcher):
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
 
+        routing_init = self.init
+        if (
+            self._single_token_mx_init is not None
+            and self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16
+            and hidden_states.shape == (1, 4096)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and self.num_experts == 160
+            and top_k == 6
+            and get_parallel().tp_size == 1
+        ):
+            routing_init = self._single_token_mx_init
+
         (
             permuted_hidden_states,
             expanded_row_idx,
             expert_tokens,
             hidden_states_scale,
-        ) = self.init._init_routing(
+        ) = routing_init._init_routing(
             hidden_states,
             topk_ids,
             self.num_experts,

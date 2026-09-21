@@ -20,6 +20,7 @@ mem_cache/common.py unpacks ``out_full_loc`` and stashes the bundle on
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -191,6 +192,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         free_pages = page_ids[self.c128_page_refcount[page_ids] == 0]
         if free_pages.numel() > 0:
+            if os.environ.get("KT_NPU_C4_CHECKPOINT_SHADOW"):
+                from npu_c4_checkpoint_shadow import final_release
+                final_release(self, free_pages)
             self.c128_attn_allocator.free(
                 free_pages * self.c128_attn_allocator.page_size
             )
@@ -265,6 +269,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             raise self._pool_exhausted(
                 ratio, "KV", c_extend, allocator.available_size()
             )
+        if os.environ.get("KT_NPU_C4_CHECKPOINT_SHADOW"):
+            from npu_c4_checkpoint_shadow import allocated
+            allocated(self, result, allocator.page_size)
         return result
 
     def c128_num_pages_needed(
@@ -541,10 +548,19 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if kv_len <= 0 or req_pool_idx is None:
             return
 
+        diagnostic = bool(os.environ.get("KT_NPU_COMPRESS_STATE_DIAG"))
+        if diagnostic:
+            from npu_compress_state_diagnostic import request_release
+            request_release(self.get_kvcache(), req, "before", kv_len)
         row = req_to_token_pool.req_to_c128_sidecar[int(req_pool_idx)]
         self.release_c128_pages(row[row > 0])
         row.zero_()
         self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
+        if diagnostic:
+            request_release(self.get_kvcache(), req, "after", kv_len)
+        if os.environ.get("KT_NPU_C4_CHECKPOINT_SHADOW"):
+            from npu_c4_checkpoint_shadow import request_finish
+            request_finish(self, req)
 
     def available_size(self):
         return min(
@@ -563,6 +579,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         super().resize(config)
 
     def clear(self):
+        if os.environ.get("KT_NPU_C4_CHECKPOINT_SHADOW"):
+            from npu_c4_checkpoint_shadow import clear
+            clear(self)
         super().clear()
         # super().__init__ calls clear() before our C128 allocator exists.
         for attr in ("c128_attn_allocator",):

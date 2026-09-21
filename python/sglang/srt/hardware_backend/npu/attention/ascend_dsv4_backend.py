@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
@@ -17,7 +18,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+    Dsv4NpuRoPE,
+    compressor_cos_sin,
+    rope_cos_sin,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
@@ -460,19 +465,43 @@ class CompressorAscendBackendMixin:
                 )
             state_block_table = table_cache[ratio]
 
-        cos, sin = Dsv4NpuRoPE.for_freqs(
-            compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
-        ).get_cos_sin(
+        # Compressor RoPE: identical FP32 gathers across c4/c128 layers sharing
+        # this freqs_cis; memoize per forward instead of one gather per layer.
+        cos, sin = compressor_cos_sin(
+            compressor.freqs_cis,
+            getattr(compressor, "rotary_emb", None),
+            forward_batch,
             getattr(fm, f"positions_cmp_padding_c{ratio}"),
-            torch.float32,
-            view_4d=False,
-            allow_build=False,
         )
 
         # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
         compressor_op = (
             torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
         )
+        shadow = None
+        if (
+            os.environ.get("KT_NPU_C4_CHECKPOINT_SHADOW")
+            and not self.graph_mode
+            and forward_batch.forward_mode.is_prefill()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            if not is_npu_arch35():
+                raise RuntimeError("C4 checkpoint shadow requires A5 CYCLE ABI")
+            from npu_c4_checkpoint_shadow import begin as begin_shadow
+            shadow = begin_shadow(
+                self, compressor, x, forward_batch, state_cache, state_block_table, cos, sin
+            )
+        diagnostic = None
+        if (
+            os.environ.get("KT_NPU_COMPRESS_STATE_DIAG")
+            and not self.graph_mode
+            and forward_batch.forward_mode.is_prefill()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            from npu_compress_state_diagnostic import begin
+            diagnostic = begin(
+                self, compressor, x, forward_batch, state_cache, state_block_table, cos, sin
+            )
         cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
@@ -493,6 +522,13 @@ class CompressorAscendBackendMixin:
             rotary_mode=2,
             cache_mode=2,
         )
+
+        if shadow is not None:
+            from npu_c4_checkpoint_shadow import finish as finish_shadow
+            finish_shadow(shadow, cmp_kv)
+        if diagnostic is not None:
+            from npu_compress_state_diagnostic import finish
+            finish(diagnostic, state_cache, cmp_kv)
 
         # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
@@ -631,11 +667,20 @@ class C4IndexerAscendBackendMixin:
         skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
-        weights, _ = c4_indexer.weights_proj(x)
+        weights = self._indexer_weights_with_capacity_diagnostic(c4_indexer, x, forward_batch)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
         if not skip_compressor:
             c4_indexer.compressor(x, forward_batch)
         return q, weights
+
+    def _indexer_weights_with_capacity_diagnostic(self, c4_indexer, x, forward_batch):
+        import os
+        if os.environ.get("KT_NPU_INDEXER_WEIGHT_CAPACITY_DIAG") == "1":
+            from npu_indexer_weight_capacity_diagnostic import run
+            diagnostic = run(c4_indexer, x, forward_batch)
+            if diagnostic is not None:
+                return diagnostic
+        return c4_indexer.weights_proj(x)[0]
 
     def _can_use_indexer_multi_stream(self) -> bool:
         return envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -674,7 +719,7 @@ class C4IndexerAscendBackendMixin:
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
-            weights = c4_indexer.weights_proj(x)[0]
+            weights = self._indexer_weights_with_capacity_diagnostic(c4_indexer, x, forward_batch)
             weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
             weights.record_stream(stream_w)
 
@@ -869,7 +914,44 @@ class C4IndexerAscendBackendMixin:
             sparse_count=self._dsv4_index_topk,
             metadata=li_quant_metadata,
         )
+        import os
+        if os.environ.get("KT_NPU_CHECK_CACHE_BOUNDS") == "1":
+            table = fm.c4_page_table.cpu().long()
+            lengths = fm.actual_seq_lengths_kv.cpu().long().reshape(-1)
+            for i, length in enumerate(lengths.tolist()):
+                pages = (length // 4 + k.shape[1] - 1) // k.shape[1]
+                active = table[i, :pages]
+                if active.numel() < pages or ((active < 0) | (active >= k.shape[0])).any():
+                    raise ValueError(f"Indexer C4 table invalid: layer={c4_indexer.layer_id} length={length} pages={pages} capacity={k.shape[0]} active={active.tolist()}")
+        if os.environ.get("KT_NPU_INDEXER_PAD_QUERY") == "1":
+            from a5_indexer_compat import pad_query_storage
+            kwargs["query"] = pad_query_storage(kwargs["query"])
+        canonical = os.environ.get("KT_NPU_CANONICAL_INDEXER", "0")
+        if canonical != "0":
+            selected = None if canonical == "1" else set(canonical.split(","))
+            kwargs = {name: value.clone(memory_format=torch.contiguous_format)
+                      if isinstance(value, torch.Tensor) and (selected is None or name in selected) else value
+                      for name, value in kwargs.items()}
+        capture_path = os.environ.get("KT_NPU_CAPTURE_INDEXER")
+        if capture_path and q.shape[0] == 1:
+            torch.npu.synchronize()
+            logger.warning("[indexer-capture] layer=%s key=%s table=%s", c4_indexer.layer_id, tuple(k.shape), tuple(fm.c4_page_table.shape))
+            torch.save({key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+                        for key, value in kwargs.items()}, capture_path)
+        if os.environ.get("KT_NPU_SYNC_INDEXER") == "1":
+            torch.npu.current_stream().synchronize()
+        indexer_capture = None
+        if os.environ.get("KT_NPU_INDEXER_PREFILL_CAPTURE"):
+            from npu_indexer_prefill_diagnostic import begin as indexer_begin, finish as indexer_finish
+            indexer_capture = indexer_begin(
+                c4_indexer.layer_id, forward_batch,
+                self._cp_local_positions(forward_batch), kwargs, q,
+            )
         topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**kwargs)
+        if indexer_capture is not None:
+            indexer_finish(indexer_capture, topk_idxs)
+        if os.environ.get("KT_NPU_SYNC_INDEXER") == "1":
+            torch.npu.current_stream().synchronize()
         return topk_idxs.view(-1, self._dsv4_index_topk)
 
     def forward_c4_indexer(
@@ -2036,6 +2118,11 @@ class DeepseekV4AscendAttnBackend(
                 )
             )
 
+        import os
+        if os.environ.get("KT_NPU_SYNC_INDEXER") == "1":
+            # Complete metadata consumption of forward-local sequence tensors
+            # before those input allocations can be recycled.
+            torch.npu.current_stream().synchronize()
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides

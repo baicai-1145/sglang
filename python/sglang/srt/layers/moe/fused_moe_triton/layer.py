@@ -165,6 +165,9 @@ def create_moe_dispatcher(
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
+        # KT must see original token rows/IDs before resident-only NPU dispatch.
+        if isinstance(quant_method, KTEPWrapperMethod):
+            return StandardDispatcher(moe_runner_config)
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
@@ -1023,6 +1026,14 @@ class FusedMoE(torch.nn.Module):
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
+            if (is_npu() and isinstance(self.quant_method, KTEPWrapperMethod)
+                    and expert_id is not None):
+                if self.quant_method.disk_offload:
+                    expert_id = self.quant_method.resident_slot_by_id.get(expert_id, -1)
+                    if expert_id < 0:
+                        return
+                elif expert_id >= self.quant_method.num_gpu_experts:
+                    return
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
@@ -1079,6 +1090,13 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        if (is_npu() and isinstance(self.quant_method, KTEPWrapperMethod)
+                and self.quant_method.disk_offload):
+            # Identity global placement is validated by the wrapper. Residency
+            # is a separate logical->slot map, including when metadata exists.
+            expert_id = self.quant_method.resident_slot_by_id.get(expert_id, -1)
+            if expert_id < 0:
+                return
         # WARN: This makes the `expert_id` mean "local" and "global" in different cases
         if not getattr(param, "_sglang_require_global_experts", False):
             expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)

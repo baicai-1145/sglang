@@ -750,6 +750,10 @@ class Scheduler(
         )
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
+        # A singleton group has no communication to prewarm. Some single-device
+        # containers cannot initialize an HCCL communicator at all.
+        if self.tp_group.world_size == 1:
+            return
         if not (
             _is_npu
             and is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config)
@@ -5123,6 +5127,9 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
+            if os.environ.get("KT_NPU_RESIDENT_DIAG_CONTROL"):
+                from npu_resident_diagnostic_control import after_idle_flush
+                after_idle_flush(self)
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:

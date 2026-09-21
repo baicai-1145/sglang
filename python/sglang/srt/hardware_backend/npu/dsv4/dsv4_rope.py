@@ -8,6 +8,7 @@ mscale: cos/sin stored in freqs_cis must already be pre-multiplied by the YARN
 mscale at precompute time (see precompute_freqs_cis). We just read what's stored.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -184,9 +185,15 @@ class Dsv4NpuRoPE:
 # Per-forward memo of position-gathered (cos, sin), stashed on the ForwardBatch
 # under this attribute by prime_rope_cos_sin (the single writer).
 _ROPE_MEMO_ATTR = "_dsv4_npu_rope_memo"
+# Per-forward memo of compressor-position FP32 gathers (positions_cmp_padding_*).
+# Keyed by (freqs_cis id, ratio); rebuilt every forward by prime_compressor_cos_sin.
+_COMPRESSOR_MEMO_ATTR = "_dsv4_npu_compressor_rope_memo"
 
 
 def prime_rope_cos_sin(attn_modules, forward_batch, positions) -> None:
+    # A reused ForwardBatch/positions storage must never retain prior-step gathers.
+    if os.environ.get('KT_NPU_COMPRESSOR_ROPE_SPLIT_MEMO') == '1':
+        setattr(forward_batch, _COMPRESSOR_MEMO_ATTR, {})
     memo: dict = {}
     for attn in attn_modules:
         freqs_cis = attn.freqs_cis
@@ -233,3 +240,39 @@ def rope_cos_sin(
         allow_build=False,
         cache_dtype=cache_dtype,
     )
+
+
+def compressor_cos_sin(
+    freqs_cis: torch.Tensor,
+    rotary_emb,
+    forward_batch,
+    positions: torch.Tensor,
+):
+    """FP32 (cos, sin) gather at compressor padding positions.
+
+    Memoized per forward across layers sharing this freqs_cis: the c4 and c128
+    compressors gather identical rows from the same table, so only the first
+    caller pays the gather. No cross-forward reuse (positions change).
+    """
+    split_memo = (
+        os.environ.get('KT_NPU_COMPRESSOR_ROPE_SPLIT_MEMO') == '1'
+        and forward_batch.forward_mode.is_decode()
+    )
+    key = (id(freqs_cis), id(positions)) if split_memo else id(freqs_cis)
+    memo = getattr(forward_batch, _COMPRESSOR_MEMO_ATTR, None)
+    if memo is not None:
+        entry = memo.get(key)
+        if entry is not None and entry[0] is positions:
+            return entry[1], entry[2]
+    cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis, rotary_emb).get_cos_sin(
+        positions,
+        torch.float32,
+        view_4d=False,
+        allow_build=False,
+        cache_dtype=torch.float32,
+    )
+    if memo is None:
+        memo = {}
+        setattr(forward_batch, _COMPRESSOR_MEMO_ATTR, memo)
+    memo[key] = (positions, cos, sin)
+    return cos, sin
