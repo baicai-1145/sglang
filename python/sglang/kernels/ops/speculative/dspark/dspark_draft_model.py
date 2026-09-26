@@ -508,6 +508,19 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
 def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
     """Whether _build_stacked_wkv_weight can handle these weights; unsupported
     quant schemes fall back to the per-linear torch path in execute()."""
+    # The stack helper concatenates on dim 0, which is the output axis only for
+    # the canonical (out, in) layout. NPU arch35 MXFP8 weight processing stores
+    # fp8 weights transposed ((in, out)): dim-0 stacking would concat the K axis
+    # and aclnnQuantMatmulV5 then rejects the fused GEMM (x1 K vs S*x1 K).
+    # Route those to the per-linear torch path (same op the target model uses).
+    first = wkv_linears[0]
+    out_features = getattr(first, "out_features", None) or getattr(
+        first, "output_size_per_partition", None
+    )
+    if out_features is not None and first.weight.dim() == 2:
+        weight = first.weight
+        if weight.shape[0] != out_features:
+            return False
     if _block_quant_stack_applies(wkv_linears=wkv_linears):
         return True
     return all(_dequant_supported(linear) for linear in wkv_linears)

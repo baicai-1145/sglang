@@ -104,20 +104,36 @@ class DSparkAttention(MqaAttentionBase):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
     ) -> None:
-        super().__init__(
-            config,
-            layer_id,
-            quant_config,
-            prefix,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            attn_tp_size=get_parallel().attn_tp_size,
-            compress_ratio=0,
-            fuse_wqa_wkv=False,
-            wo_a_fp8=False,
-            wo_a_keeps_quant_config=False,
-            wo_b_reduce_results=True,
-            rope_original_seq_len=0,
-        )
+        # NPU arch35: the base class force-quantizes wo_a for its native MXFP8
+        # absorb GEMM (use_npu_arch35_mxfp8_wo_a). The DSpark draft instead runs
+        # wo_a as a plain bf16 matmul over the (G, R, D) weight view, and its
+        # load_weights stream-dequantizes ckpt wo_a fp8+scale to dense bf16, so
+        # a quantized wo_a module (weight_scale_inv param) can never be filled.
+        # Suppress exactly that one base-class decision for the draft attention
+        # only, via a scoped module-global patch (deepseek_v4.py itself stays
+        # untouched; restored right after construction). Mirrors the CUDA path,
+        # where wo_a_fp8=False alone is enough.
+        from sglang.srt.models import deepseek_v4 as _ds_base
+
+        _orig_use_arch35 = _ds_base.use_npu_arch35_mxfp8_wo_a
+        _ds_base.use_npu_arch35_mxfp8_wo_a = lambda quant_config: False
+        try:
+            super().__init__(
+                config,
+                layer_id,
+                quant_config,
+                prefix,
+                attn_tp_rank=get_parallel().attn_tp_rank,
+                attn_tp_size=get_parallel().attn_tp_size,
+                compress_ratio=0,
+                fuse_wqa_wkv=False,
+                wo_a_fp8=False,
+                wo_a_keeps_quant_config=False,
+                wo_b_reduce_results=True,
+                rope_original_seq_len=0,
+            )
+        finally:
+            _ds_base.use_npu_arch35_mxfp8_wo_a = _orig_use_arch35
         assert self.compress_ratio == 0, (
             "DSpark draft attention requires compress_ratio == 0."
         )
@@ -1146,6 +1162,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        if self.uses_own_vocab_modules:
+            # Local vocab modules are only fed by the top-level embed/head keys
+            # (see _remap_dspark_weight_name_npu); if that mapping ever misses,
+            # the modules would silently stay torch.empty and the draft would
+            # propose garbage. Fail loudly instead.
+            missing_vocab = (
+                {"embed_tokens.weight", "lm_head.weight"} - loaded_params
+            )
+            if missing_vocab:
+                raise ValueError(
+                    "DSpark V4 draft local vocab modules got no checkpoint "
+                    f"weights: missing {sorted(missing_vocab)}. The checkpoint "
+                    "layout does not match the NPU draft loader mapping."
+                )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
@@ -1202,6 +1232,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return f"stages.{stage_id}.{mapped_rest}"
 
     def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
+        # REAP/ModelSlim K160 checkpoints keep a single QuaRot-aligned vocab pair
+        # at the TOP level (embed.weight / head.weight) -- the same tensors the
+        # target model loads. The upstream layout this remapper was written for
+        # (mtp.<0>.embed.weight / mtp.<last>.head.weight) does not occur here.
+        # Without mapping the top-level pair, the draft's own embed_tokens/
+        # lm_head (uses_own_vocab_modules=True on NPU) stay torch.empty and the
+        # draft proposes garbage: accept len ~1.0 with target outputs still
+        # correct and no loader warning (GH200 shared-expent-style silent miss).
+        if self.uses_own_vocab_modules:
+            if name == "embed.weight":
+                return "embed_tokens.weight"
+            if name == "head.weight":
+                return "lm_head.weight"
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
         if "rotary_emb.inv_freq" in name:

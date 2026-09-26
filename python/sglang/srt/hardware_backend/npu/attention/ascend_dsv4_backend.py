@@ -60,6 +60,21 @@ def _sparse_attn_ops():
     )
 
 
+def _has_opplugin_sparse_attn_ops() -> bool:
+    """Whether the torch_npu op-plugin override ops exist in this build.
+
+    The dspark draft worker branches to torch.ops.npu.sparse_attn_sharedkv{,_metadata_host}
+    (op-plugin namespace). Those schemas are gated behind
+    SGL_KERNEL_ENABLE_A3_ONLY_OPS in sgl-kernel-npu and their device kernels are
+    arch32-only, so on 950PR builds they are absent. In that case the draft uses
+    the same vendor kv-quant ops as the target (cu_seqlens_ori_kv is a reserved
+    but schema-valid input there).
+    """
+    return hasattr(torch.ops.npu, "sparse_attn_sharedkv_metadata_host") and hasattr(
+        torch.ops.npu, "sparse_attn_sharedkv"
+    )
+
+
 def _sparse_attn_kv_quant_kwargs() -> dict:
     """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
     if not is_npu_arch35():
@@ -1090,7 +1105,16 @@ class DeepseekV4AscendAttnBackend(
             return
 
         block_size = int(forward_batch.spec_info.draft_token_num)
-        out_cache_loc = forward_batch.out_cache_loc
+
+        if not _has_opplugin_sparse_attn_ops():
+            # Vendor kv-quant kernels (950PR) implement the trailing-window
+            # semantics natively from the TND layout + seqused_kv -- the same
+            # contract the target's verify pass already runs with
+            # (ori_win_left = window-1, causal rows within the draft block).
+            # The sparse-indices map and the widened window below are A3
+            # op-plugin conventions; the vendor op rejects win_left != 127
+            # ("should only be 127") and treats ori_sparse_indices as reserved.
+            return
 
         ori_sparse_indices = self._build_dspark_sparse_indices(
             seq_lens=forward_batch.seq_lens,
@@ -1451,7 +1475,11 @@ class DeepseekV4AscendAttnBackend(
         metadata.ori_sparse_indices = None
         metadata.ori_win_left = self._dsv4_sliding_window_size - 1
         metadata.ori_win_right = 0
-        if self._is_dspark_draft_worker and forward_mode.is_target_verify():
+        if (
+            self._is_dspark_draft_worker
+            and _has_opplugin_sparse_attn_ops()
+            and forward_mode.is_target_verify()
+        ):
             metadata.ori_sparse_indices = self.graph_metadata["ori_sparse_indices"][:T]
             metadata.ori_sparse_indices.fill_(-1)
             metadata.ori_sparse_indices[:, :, 0] = 0
@@ -1834,10 +1862,13 @@ class DeepseekV4AscendAttnBackend(
 
         dst = getattr(ctx.fm, "ori_sparse_indices", None)
         if dst is None:
-            raise RuntimeError(
-                "DSpark NPU graph replay is missing its captured "
-                "ori_sparse_indices buffer."
-            )
+            # Vendor kv-quant path (950PR): capture allocated no sparse-indices
+            # buffer (op-plugin-only convention; the vendor op derives the
+            # trailing window from TND + seqused_kv with ori_win_left =
+            # window-1, already set by the metadata builder). Nothing to
+            # refresh -- mirror the eager vendor branch instead of demanding
+            # an A3-only capture buffer.
+            return
 
         if ctx.is_idle_replay:
             dst.fill_(-1)
@@ -2067,7 +2098,7 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and _has_opplugin_sparse_attn_ops():
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
@@ -2192,7 +2223,7 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=1,
         )
         _, attn_op = _sparse_attn_ops()
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and _has_opplugin_sparse_attn_ops():
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
             attn_op = torch.ops.npu.sparse_attn_sharedkv
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
