@@ -622,6 +622,24 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        import os as _os
+        import sys as _sys
+        if _os.environ.get("SGLANG_KVBRIDGE_TRACE") == "1":
+            print("[kvb] POOL hook fired", file=_sys.stderr, flush=True)
+            print(f"[kvbridge-trace] radix_fused_norm_rope layer={layer_id} "
+                  f"flag={_os.environ.get('SGLANG_OPT_USE_FUSED_KVBRIDGE')} "
+                  f"T={kv.shape[0]} arch35={is_npu_arch35()}", flush=True)
+        # Optional fused single-kernel path (K_fused v4: rms+rope+quant+pack+
+        # scatter in one launch). Off by default; see exp-p3-tilelang/
+        # probe2-kvbridge/PB_REPORT.md for the numeric/perf evidence.
+        import os
+        if os.environ.get("SGLANG_OPT_USE_FUSED_KVBRIDGE", "0") == "1":
+            self._write_a5_fused_kvbridge(
+                layer_id=layer_id, swa_loc=swa_loc, kv=kv,
+                kv_weight=kv_weight, eps=eps,
+                freqs_cis=freqs_cis, positions=positions,
+            )
+            return
         kv_out = torch_npu.npu_rms_norm(kv, kv_weight, eps)[0]
 
         rope_dim = freqs_cis.shape[-1] * 2
@@ -648,6 +666,47 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_id,
             safe_swa_loc,
             kv_out,
+        )
+
+    def _write_a5_fused_kvbridge(
+        self,
+        *,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Fused K_fused path: replaces the 4-kernel vendor chain (rms_norm,
+        inplace_partial_rotary_mul, kv_compress_epilog, scale bridge) with one
+        tilelang kernel. Byte-exact vs the vendor chain (pool-level A/B passed
+        for T=1/3/16/37 incl. padded buckets; see PD_REPORT.md)."""
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+        rope_dim = freqs_cis.shape[-1] * 2
+        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
+            positions, kv.dtype, view_4d=False, allow_build=True,
+            cache_dtype=torch.float32,
+        )
+        # kernel consumes the de-interleaved half ([T, rope_dim/2] fp32)
+        cos_r = cos[:, ::2].contiguous()
+        sin_r = sin[:, ::2].contiguous()
+        buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+        pool = buf.view(-1, buf.shape[-1])  # (npu_rows, 640) fp8 view
+        npool = pool.shape[0]
+        from fused_kv_bridge import FusedKVBridge
+
+        FusedKVBridge.run(
+            kv.reshape(-1, kv.shape[-1]).contiguous(),
+            kv_weight,
+            eps,
+            cos_r,
+            sin_r,
+            swa_loc.reshape(-1).clamp_min(0).to(torch.int64),
+            pool,
+            npool,
         )
 
     def set_compress_buffer(

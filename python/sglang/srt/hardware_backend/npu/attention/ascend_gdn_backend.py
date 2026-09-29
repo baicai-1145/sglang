@@ -1,6 +1,8 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
+import torch_npu
 from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
@@ -19,6 +21,97 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 fused_gdn_gating = fused_gdn_gating_npu
+
+
+def _chunk_gated_delta_rule_native(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+):
+    initial_dtype = query.dtype
+    # query/key: [B, T, H, K], value: [B, T, H, V], beta/g: [B, T, H]
+    query = query.transpose(1, 2).contiguous().to(torch.float32)
+    key = key.transpose(1, 2).contiguous().to(torch.float32)
+    value = value.transpose(1, 2).contiguous().to(torch.float32)
+    beta = beta.transpose(1, 2).contiguous().to(torch.float32)
+    g = g.transpose(1, 2).contiguous().to(torch.float32)
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    total_sequence_length = sequence_length + pad_size
+
+    if pad_size > 0:
+        query = F.pad(query, (0, 0, 0, pad_size))
+        key = F.pad(key, (0, 0, 0, pad_size))
+        value = F.pad(value, (0, 0, 0, pad_size))
+        beta = F.pad(beta, (0, pad_size))
+        g = F.pad(g, (0, pad_size))
+
+    scale = 1 / (k_head_dim ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    num_chunks = total_sequence_length // chunk_size
+    query = query.reshape(batch_size, num_heads, num_chunks, chunk_size, k_head_dim)
+    key = key.reshape(batch_size, num_heads, num_chunks, chunk_size, k_head_dim)
+    value = value.reshape(batch_size, num_heads, num_chunks, chunk_size, v_head_dim)
+    k_beta = k_beta.reshape(batch_size, num_heads, num_chunks, chunk_size, k_head_dim)
+    v_beta = v_beta.reshape(batch_size, num_heads, num_chunks, chunk_size, v_head_dim)
+    g = g.reshape(batch_size, num_heads, num_chunks, chunk_size)
+
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value_chunk = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=torch.float32, device=query.device)
+        if initial_state is None
+        else initial_state.transpose(-1, -2).contiguous().to(torch.float32)
+    )
+    core_attn_out = torch.zeros_like(value_chunk)
+    mask_diag = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
+
+    for i in range(0, num_chunks):
+        q_i = query[:, :, i]
+        k_i = key[:, :, i]
+        v_i = value_chunk[:, :, i]
+        attn_block = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_diag, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn_block @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    core_attn_out = core_attn_out.reshape(batch_size, num_heads, total_sequence_length, v_head_dim)
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    # Restore physical (V, K) layout to match SGLang temporal state pool
+    last_recurrent_state = last_recurrent_state.transpose(-1, -2).contiguous()
+    return core_attn_out, last_recurrent_state
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -258,32 +351,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
-            g, beta = fused_gdn_gating_kernel_without_sigmoid(
-                layer.A_log, a, b, layer.dt_bias
-            )
-            beta = beta.unsqueeze(0)
-            num_heads, head_k_dim = layer.num_q_heads, layer.head_q_dim
-            num_value_heads, head_v_dim = layer.num_v_heads, layer.head_v_dim
-
-            mixed_qkv_last_dim = mixed_qkv.shape[-1]
-
-            mixed_qkv = mixed_qkv.view(batch_size, -1, mixed_qkv_last_dim)
-            beta = beta.view(batch_size, -1, num_value_heads)
-            g = g.view(batch_size, -1, num_value_heads)
-
-            core_attn_out = self.fused_recurrent_gated_delta_rule_update(
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            batch_size = forward_batch.batch_size
+            query, key, value = torch.split(
                 mixed_qkv,
-                num_heads,
-                num_value_heads,
-                head_k_dim,
-                head_v_dim,
-                recurrent_state=ssm_states,
-                beta=beta,
-                g=g,
-                cache_indices=cache_indices,
-                intermediate_state=intermediate_state_cache,
+                [layer.q_dim, layer.k_dim, layer.v_dim],
+                dim=-1,
             )
-            core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
+            query = query.view(batch_size, draft_token_num, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(batch_size, draft_token_num, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim)
+            a_v = a.view(batch_size, draft_token_num, layer.num_v_heads)
+            b_v = b.view(batch_size, draft_token_num, layer.num_v_heads)
+
+            from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+                fused_sigmoid_gating_delta_rule_update_npu,
+            )
+
+            core_attn_out = fused_sigmoid_gating_delta_rule_update_npu(
+                A_log=layer.A_log,
+                a=a_v,
+                dt_bias=layer.dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=query,
+                k=key,
+                v=value,
+                b=b_v,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices[:batch_size],
+                use_qk_l2norm_in_kernel=True,
+                disable_state_update=True,
+                intermediate_states_buffer=intermediate_state_cache,
+                cache_steps=draft_token_num,
+            )
+            core_attn_out = core_attn_out.view(-1, layer.num_v_heads, layer.head_v_dim)
             if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
                 core_attn_out = torch.cat(
                     [
@@ -352,20 +454,70 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             else None
         )
         h = k.new_empty(
-            len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
+            len(chunk_indices) if chunk_indices is not None else 1,
+            v.shape[-2],
+            v.shape[-1],
+            k.shape[-1],
         )  # [NT, NH, DV, Dk]
 
-        core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            beta=beta,
-            initial_state=initial_state,
-            actual_seq_lengths=self.actual_seq_lengths,
-            scale=scale,
-            chunk_state=h,
-            g=g,
+        # Ensure g and beta are 2D [T, Nv]
+        if g.dim() == 3 and g.shape[0] == 1:
+            g = g.squeeze(0)
+        if beta.dim() == 3 and beta.shape[0] == 1:
+            beta = beta.squeeze(0)
+
+        num_heads = q.shape[-2]
+        num_value_heads = v.shape[-2]
+        if num_value_heads // num_heads > 1:
+            q = q.repeat_interleave(num_value_heads // num_heads, dim=-2)
+            k = k.repeat_interleave(num_value_heads // num_heads, dim=-2)
+
+        op_fn = getattr(torch.ops.npu, "npu_chunk_gated_delta_rule", None) or getattr(
+            torch.ops.npu, "chunk_gated_delta_rule", None
         )
+        if op_fn is not None:
+            try:
+                core_attn_out, last_recurrent_state = op_fn(
+                    q,
+                    k,
+                    v,
+                    beta=beta,
+                    initial_state=initial_state,
+                    actual_seq_lengths=self.actual_seq_lengths,
+                    scale=scale,
+                    g=g,
+                )
+                return core_attn_out, last_recurrent_state, h
+            except Exception as e:
+                pass
+
+        # Fallback to native implementation on NPU
+        if cu_seqlens is None:
+            batch_size = initial_state.shape[0] if initial_state is not None else 1
+            cu_seqlens = torch.tensor([0, q.shape[0]], dtype=torch.int32, device=q.device)
+        else:
+            batch_size = len(cu_seqlens) - 1
+
+        out_list = []
+        final_states = []
+        for b in range(batch_size):
+            start = cu_seqlens[b].item()
+            end = cu_seqlens[b + 1].item()
+            q_b = q[start:end].unsqueeze(0)
+            k_b = k[start:end].unsqueeze(0)
+            v_b = v[start:end].unsqueeze(0)
+            g_b = g[start:end].unsqueeze(0)
+            beta_b = beta[start:end].unsqueeze(0)
+            s_b = initial_state[b : b + 1] if initial_state is not None else None
+
+            o_b, s_next = _chunk_gated_delta_rule_native(
+                q_b, k_b, v_b, g_b, beta_b, chunk_size=chunk_size, initial_state=s_b
+            )
+            out_list.append(o_b.squeeze(0))
+            final_states.append(s_next)
+
+        core_attn_out = torch.cat(out_list, dim=0)
+        last_recurrent_state = torch.cat(final_states, dim=0)
         return core_attn_out, last_recurrent_state, h
 
     def fused_recurrent_gated_delta_rule_update(
@@ -381,7 +533,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices: torch.Tensor,
         intermediate_state: Optional[torch.Tensor] = None,
     ):
-        beta = beta.to(torch.bfloat16)
+        beta = beta.contiguous()
         g = g.to(torch.float32)
         batch_size = mix_qkv.shape[0]
         seq_len = mix_qkv.shape[1]
@@ -405,19 +557,39 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
 
-        attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
-            mix_qkv,
+        # Split mix_qkv into query, key, value
+        mix_qkv_flat = mix_qkv.view(-1, mix_qkv.shape[-1])
+        q_dim = num_heads * head_k_dim
+        k_dim = num_heads * head_k_dim
+        v_dim = num_value_heads * head_v_dim
+        q_flat, k_flat, v_flat = torch.split(mix_qkv_flat, [q_dim, k_dim, v_dim], dim=-1)
+        # Vendor op (custom_transformer, RGDR_FUSED_GDN=1 default) applies
+        # l2norm(q,k) + sigmoid(beta) in-kernel in full fp32, and maps GQA
+        # heads natively (kHeadIdx = vHeadIdx / (NV/NK)) — pass raw tensors.
+        q_flat = q_flat.view(-1, num_heads, head_k_dim).contiguous()
+        k_flat = k_flat.view(-1, num_heads, head_k_dim).contiguous()
+        v_flat = v_flat.view(-1, num_value_heads, head_v_dim).contiguous()
+
+        beta_flat = beta.view(-1, num_value_heads).contiguous()
+        g_flat = g.view(-1, num_value_heads).to(torch.float32).contiguous()
+        ssm_indices_flat = ssm_state_indices.view(-1).contiguous()
+
+        op_recurrent = getattr(torch_npu, "npu_recurrent_gated_delta_rule", None) or getattr(
+            torch.ops.npu, "npu_recurrent_gated_delta_rule", None
+        )
+        assert op_recurrent is not None, "npu_recurrent_gated_delta_rule operator not found"
+
+        attn_core_out = op_recurrent(
+            q_flat,
+            k_flat,
+            v_flat,
             recurrent_state,
-            beta=beta,
+            beta=beta_flat,
             scale=scale,
             actual_seq_lengths=actual_seq_lengths,
-            ssm_state_indices=ssm_state_indices.view(batch_size, seq_len),
-            nk=num_heads,
-            nv=num_value_heads,
-            intermediate_state=intermediate_state,
-            cache_indices=cache_indices,
+            ssm_state_indices=ssm_indices_flat,
             num_accepted_tokens=num_accept_tokens,
-            g=g,
+            g=g_flat,
         )
 
         if intermediate_state is not None:
