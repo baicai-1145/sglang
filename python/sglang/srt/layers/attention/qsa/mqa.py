@@ -107,12 +107,15 @@ def torch_qsa_mqa_decode(
 
 
 if HAS_TILELANG:
+    _tl_fast_math = getattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH", "enable_fast_math")
+    _tl_no_tma = getattr(tilelang.PassConfigKey, "TL_DISABLE_TMA_LOWER", "disable_tma_lower")
+    _tl_no_warp = getattr(tilelang.PassConfigKey, "TL_DISABLE_WARP_SPECIALIZED", "disable_warp_specialized")
 
     @tilelang.jit(
         pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            _tl_fast_math: True,
+            _tl_no_tma: True,
+            _tl_no_warp: True,
         }
     )
     def _tilelang_qsa_mqa_prefill_kernel(
@@ -195,8 +198,8 @@ if HAS_TILELANG:
 
     @tilelang.jit(
         pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            _tl_fast_math: True,
+            _tl_no_tma: True,
         }
     )
     def _tilelang_qsa_mqa_decode_kernel(

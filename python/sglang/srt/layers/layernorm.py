@@ -833,7 +833,7 @@ class RMSNorm(BaseFusedOp):
 
             x_var = x[..., : self.variance_size_override]
 
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+        variance = (x_var * x_var).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
 
         if self.cast_x_before_out_mul:
@@ -1129,7 +1129,7 @@ class GemmaRMSNorm(BaseFusedOp):
             residual = x
 
         x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        variance = (x * x).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = x * (1.0 + self.weight.float())
         x = x.to(orig_dtype)
@@ -1291,7 +1291,7 @@ class Gemma3RMSNorm(BaseFusedOp):
         # Re-dispatch
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.eps)
 
     def forward_native(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None:
@@ -1381,8 +1381,8 @@ class Gemma4RMSNorm(BaseFusedOp):
         )
 
     def _norm(self, x):
-        mean_squared = x.pow(2).mean(-1, keepdim=True) + self.eps
-        return x * torch.pow(mean_squared, -0.5)
+        variance = (x * x).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         normed_output = self._norm(x.float())
@@ -1447,12 +1447,12 @@ class RMSNormWithoutScale(BaseFusedOp):
         self.eps = eps
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.eps)
 
     def forward_native(self, x):
         orig_dtype = x.dtype
         x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        variance = (x * x).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return x.to(orig_dtype)
 
