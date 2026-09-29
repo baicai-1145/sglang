@@ -1636,22 +1636,79 @@ class MQALayer(MqaAttentionBase):
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
-            kv = self.kv_norm(kv)
-            cos4_k, sin4_k = self._get_npu_rope_position_cache(
-                forward_batch, positions, kv.dtype, inverse=False
-            )
-            Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                kv.unsqueeze(1),
-                None,
-                cos4_k,
-                sin4_k,
-                qk_nope_dim=self.qk_nope_head_dim,
-            )
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv,
-                forward_batch=forward_batch,
-            )
+            import os as _os
+            if _os.environ.get("SGLANG_KVBRIDGE_TRACE") == "1":
+                import sys as _sys
+                MqaAttentionBase._kvb_n = getattr(MqaAttentionBase, "_kvb_n", 0) + 1
+                print(f"[kvb] multi-stream hook #{MqaAttentionBase._kvb_n} T={kv.shape[0]}", file=_sys.stderr, flush=True)
+            if _os.environ.get("SGLANG_OPT_USE_FUSED_KVBRIDGE", "0") == "1":
+                # Single-kernel fused path (K_fused v4): rms+rope+quant+pack+
+                # scatter in one launch, replacing the inline rms + rope +
+                # store_cache chain below. Byte-exact vs vendor chain (see
+                # probe2-kvbridge/PD_REPORT.md pool-level A/B).
+                from fused_kv_bridge import FusedKVBridge
+
+                pool = get_token_to_kv_pool()
+                loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+                buf = pool.swa_kv_pool.kv_buffer[
+                    pool._swa_local_layer_id(self.layer_id)
+                ]
+                pool_rows = buf.view(-1, buf.shape[-1])
+                cos_r, sin_r = self._get_npu_rope_position_cache(
+                    forward_batch, positions, kv.dtype, inverse=False
+                )
+                # de-interleave to the [T, rope/2] halves the kernel consumes
+                _cos_full = cos_r.reshape(kv.shape[0], -1).float().contiguous()
+                _sin_full = sin_r.reshape(kv.shape[0], -1).float().contiguous()
+                cos_r = _cos_full.contiguous()
+                sin_r = _sin_full.contiguous()
+                FusedKVBridge.run(
+                    kv.reshape(-1, kv.shape[-1]).contiguous(),
+                    self.kv_norm.weight.data,
+                    self.eps,
+                    cos_r,
+                    sin_r,
+                    loc.reshape(-1).clamp_min(0).to(torch.int64),
+                    pool_rows,
+                    pool_rows.shape[0],
+                )
+                if _os.environ.get("SGLANG_KVBRIDGE_SYNC_DIAG") == "1":
+                    torch.npu.synchronize()
+                if _os.environ.get("SGLANG_KVBRIDGE_DUMP") == "1":
+                    # dump BOTH inputs and the written row for offline diff
+                    import json as _json
+                    FusedKVBridge._dump_n = getattr(FusedKVBridge, "_dump_n", 0) + 1
+                    if FusedKVBridge._dump_n <= 8:
+                        _row = pool_rows.view(torch.uint8)[loc.reshape(-1)[0].clamp_min(0).item()].cpu().tolist()
+                        _json.dump({
+                            "n": FusedKVBridge._dump_n, "layer": self.layer_id,
+                            "T": int(kv.shape[0]),
+                            "kv": kv.reshape(-1, kv.shape[-1]).contiguous().float().cpu().tolist(),
+                            "w": self.kv_norm.weight.data.float().cpu().tolist(),
+                            "eps": self.eps,
+                            "cos": cos_r.cpu().tolist(), "sin": sin_r.cpu().tolist(),
+                            "cos_full": _cos_full.cpu().tolist(), "sin_full": _sin_full.cpu().tolist(),
+                            "loc": loc.reshape(-1).cpu().tolist(),
+                            "positions": positions.reshape(-1).cpu().tolist(),
+                            "pool_row": _row,
+                        }, open(f"/workspace/sglang/.tmp/fusion-batch/exp-p3-tilelang/probe2-kvbridge/.tmp_kvdump_{FusedKVBridge._dump_n}.json", "w"))
+            else:
+                kv = self.kv_norm(kv)
+                cos4_k, sin4_k = self._get_npu_rope_position_cache(
+                    forward_batch, positions, kv.dtype, inverse=False
+                )
+                Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                    kv.unsqueeze(1),
+                    None,
+                    cos4_k,
+                    sin4_k,
+                    qk_nope_dim=self.qk_nope_head_dim,
+                )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         # Q block on stream_q (needs only q_lora).
         with torch.npu.stream(stream_q):
