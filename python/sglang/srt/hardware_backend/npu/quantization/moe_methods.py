@@ -37,7 +37,7 @@ def _require_e8m0_dtype():
     The grouped matmuls validate their scale-dtype arguments against torch_npu's
     own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on A5) and reject the torch
     dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
-    but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
+    but the actual value is Float8_e8m0fnu" - hence torch_npu first, torch only
     as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
     ``_get_float8_e8m0fnu_dtype`` reads it off torch.
 
@@ -60,7 +60,7 @@ def _require_e8m0_dtype():
             _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
         if _E8M0_DTYPE is None:
             raise RuntimeError(
-                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend A5 "
+                "float8_e8m0fnu dtype not found - MXFP8 MoE requires Ascend A5 "
                 "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
             )
     return _E8M0_DTYPE
@@ -283,7 +283,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
         # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
-        # accepts FP4 weights via weight_scale/weight_dtype — verified on A5
+        # accepts FP4 weights via weight_scale/weight_dtype - verified on A5
         # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
         # chain modulo the output fp8 requant, which the unfused chain also
         # applies before gmm2).
@@ -1070,7 +1070,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
     gmm1 re-quantises its own output, so it is a single fused kernel rather than
     a matmul plus a separate activation: the runner calls
-    ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
+    ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 - hence the
     per-prefix matmul chosen here.
 
     Where the *activation* quant happens depends on the dispatcher. On
@@ -1115,6 +1115,28 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             self, shim, weight_prefix
         )  # explicit self: shim is the quant_info
 
+    def _get_w8a16_bf16_grouped(self, quant_info, weight_prefix: str) -> torch.Tensor:
+        """BF16 grouped-weight for the W8A16 graph-capture fallback.
+
+        In graph mode the stored weight IS the bf16 tensor already; in eager
+        mode reconstruct it from the int8 payload + per-channel scales
+        (cached, NPU-resident).
+        """
+        w = getattr(quant_info, f"{weight_prefix}_weight")
+        if w.dtype == torch.bfloat16:
+            return w
+
+        cached = NPUMXFP8MoEMethod._deq_cache.get(("w8a16g", weight_prefix, id(quant_info)))
+        if cached is not None:
+            return cached
+        w_i8 = getattr(quant_info, f"{weight_prefix}_weight")  # [E,K,N] int8
+        pc = getattr(quant_info, f"{weight_prefix}_weight_scale")  # [E,1,N]
+        w_bf16 = (
+            w_i8.to(torch.float32) * pc.to(torch.float32)  # [E,K,N]*[E,1,N]
+        ).to(torch.bfloat16)  # [E,K,N] bf16, grouped-op orientation
+        NPUMXFP8MoEMethod._deq_cache[("w8a16g", weight_prefix, id(quant_info))] = w_bf16
+        return w_bf16
+
     def _get_deq_bf16_weight(self, quant_info, weight_prefix: str) -> torch.Tensor:
         """Cache the BF16-dequantised grouped weight for the A/B experiment."""
         weight = getattr(quant_info, f"{weight_prefix}_weight")
@@ -1124,7 +1146,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             return cached
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale")
         # stored: weight = NZ(w).transpose(1,2) strided view [E, K, N].
-        # The view's base is the contiguous NZ tensor [E, N, K] — cast that
+        # The view's base is the contiguous NZ tensor [E, N, K] - cast that
         # back to ND (verified offline: NZ→ND via npu_format_cast(fmt=2) is
         # legal and lossless), then dequantise with the e8m0 scales.
         w_maybe = weight.data
@@ -1145,10 +1167,10 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         else:
             w_src = torch.ops.npu.npu_format_cast(w_maybe, 2)
         E, N, K = w_src.shape
-        # Fully vectorised dequant — the per-expert Python loop measured
-        # ~3.4 s/weight at production shapes (80 weights ≈ 4.5 min, which
+        # Fully vectorised dequant - the per-expert Python loop measured
+        # ~3.4 s/weight at production shapes (80 weights ~ 4.5 min, which
         # blew the stage-startup timeout). Peak NPU memory is one fp32 copy
-        # of the weight (≤1 GiB) — fine with ~79 GiB free after loading.
+        # of the weight (≤1 GiB) - fine with ~79 GiB free after loading.
         s_flat = (
             scale.data.transpose(1, 2).reshape(E, N, -1).view(torch.uint8)
         )  # [E, N, K//32]
@@ -1194,6 +1216,32 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # aclnnGroupedMatmul rejects quantised weights in every layout,
             # so loop the experts and call npu_weight_quant_batchmatmul per
             # expert (~8us/call; topk8 x 2 projections ~ 128us/token).
+            #
+            # GRAPH CAPTURE: the python loop bounds (expert counts) are CPU
+            # state and cannot vary across replays, so inside NPUGraph capture
+            # fall back to the BF16 grouped matmul over the int8-dequantised
+            # cache (numerically BETTER: exact bf16 weights, and the plain
+            # bf16 grouped op is capture-safe). Eager decode keeps the int8
+            # loop; graph replay is bf16 - both well inside the deqv quality
+            # envelope measured earlier.
+            # graph-mode stores bf16 weights (no int8 payload), so both
+            # the capture branch AND the eager warmup runs (dtype probe) take
+            # the bf16 grouped fallback in that mode.
+            _w_probe = getattr(quant_info, f"{weight_prefix}_weight")
+            if (
+                torch.npu.is_current_stream_capturing()
+                or _w_probe.dtype != torch.int8
+            ):
+                deq = self._get_w8a16_bf16_grouped(quant_info, weight_prefix)
+                return torch.ops.npu.npu_grouped_matmul(
+                    x=[hidden_states.to(torch.bfloat16)],
+                    weight=[deq],
+                    group_list=expert_tokens.to(torch.int64),
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    output_dtype=torch.bfloat16,
+                )[0]
             w_i8 = getattr(quant_info, f"{weight_prefix}_weight")  # [E,K,N]
             pc = getattr(quant_info, f"{weight_prefix}_weight_scale")  # [E,1,N]
             hs = (
@@ -1205,7 +1253,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
                     else hidden_states.to(torch.bfloat16)
                 )
             )
-            # w13 path: hidden may be fp8+scale from the dispatcher — that
+            # w13 path: hidden may be fp8+scale from the dispatcher - that
             # only happens after apply_fused_gmm1_swiglu which this env never
             # takes; assert defensively instead of silently requantising.
             assert hs.dtype == torch.bfloat16, (
@@ -1259,7 +1307,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # A/B experiment (v17): process_weights_after_loading already
             # replaced the FP8 parameter with the dequantised BF16 weight
             # (same NZ cast + transpose layout as the FP8 path), so this is
-            # now a plain bf16 grouped matmul — numerically equivalent to
+            # now a plain bf16 grouped matmul - numerically equivalent to
             # the pre-MXFP8 serving path. If mid/late-sequence drift
             # disappears under this flag, the W8A8 chain is the culprit.
             deq = getattr(quant_info, f"{weight_prefix}_weight")
@@ -1373,7 +1421,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # FRACTAL_NZ before the transpose, never after. gmm1 asserts that weight
         # and weight_scale carry the SAME transpose flag (CheckMXTranspose: "the
         # transposition of weightScale/weight should be equal"), and the cast
-        # yields a physically retiled — hence non-transposed — tensor. Casting
+        # yields a physically retiled - hence non-transposed - tensor. Casting
         # the [E, K, N] view would therefore leave the weight at false against a
         # true scale and fail outright, which is why this cannot copy the int8
         # MoE methods above (they transpose first, but carry no MX scale to keep
@@ -1400,7 +1448,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # The offline path above already pair-split the scale to
             # [E, N, K//64, 2] via a plain reshape (order-preserving view),
             # so a plain reshape back to [E, N, K//32] restores sequential
-            # per-32 blocks — no permute needed.
+            # per-32 blocks - no permute needed.
             if _os.environ.get("DRAMA3_DEBUG_W8A16"):
                 print(
                     f"[w8a16-load] {weight_prefix}: w_f={tuple(w_f.shape)} "
@@ -1427,6 +1475,42 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             _w_i8_final = (
                 w_i8.transpose(1, 2).contiguous()
             )  # [E,K,N] 3-D
+            if _os.environ.get("DRAMA3_NPU_ENABLE_DECODE_GRAPH"):
+                # Graph mode: the capture branch never reads the int8 payload
+                # (it uses the bf16 grouped fallback), and keeping BOTH the
+                # int8 tensors AND the 21.5 GiB bf16 cache overflows the
+                # stage budget (measured 99.04 GiB against 83.75 at 0.68
+                # fraction). Store bf16 ONLY - numerically superior (exact
+                # per-channel dequant, no int8 rounding) and the eager int8
+                # loop simply never arms in this mode.
+                _w_bf16 = (
+                    _w_i8_final.to(torch.float32)
+                    * pc_scale.transpose(1, 2).to(torch.float32)  # [E,1,N]
+                ).to(torch.bfloat16)
+                del _w_i8_final
+                if _os.environ.get("DRAMA3_DEBUG_W8A16"):
+                    print(
+                        f"[w8a16-store] {weight_prefix}: bf16-only "
+                        f"{tuple(_w_bf16.shape)} ptr={_w_bf16.data_ptr()}",
+                        flush=True,
+                    )
+                setattr(
+                    layer,
+                    f"{weight_prefix}_weight",
+                    Parameter(_w_bf16, requires_grad=False),
+                )
+                setattr(
+                    layer,
+                    f"{weight_prefix}_weight_scale",
+                    Parameter(
+                        torch.empty(0, device=_w_bf16.device, dtype=torch.uint8),
+                        requires_grad=False,
+                    ),
+                )
+                if weight_prefix == "w13":
+                    self._set_dispatcher_output_dtype(layer, "bf16")
+                _os.environ.setdefault("DRAMA3_MOE_DEQ_GEMM", "1")
+                return
             if _os.environ.get("DRAMA3_DEBUG_W8A16"):
                 print(
                     f"[w8a16-store] {weight_prefix}: stored "
@@ -1457,16 +1541,16 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
         if _os.environ.get("DRAMA3_MOE_DEQ_GEMM"):
             # A/B experiment: dequantise NOW, while the weight is still a
-            # contiguous ND tensor — after the NZ cast + Parameter(transpose)
+            # contiguous ND tensor - after the NZ cast + Parameter(transpose)
             # below, every materialisation (to/clone/contiguous) hits the
             # aclnn "internal format" wall and aborts the process.
             # Vectorised: peak NPU fp32 is one weight copy (≤1 GiB).
-            # NOTE host cgroup is 32 GiB — NEVER stage the dequantised
+            # NOTE host cgroup is 32 GiB - NEVER stage the dequantised
             # weights on the CPU (the 21.5 GiB cache OOM-killed the stage,
             # exit=-9). Keep the BF16 result resident on the NPU instead:
             # peak transient is one fp32 weight (≤1 GiB) with ~79 GiB free,
             # and the steady state swaps FP8+scales (~10.8 GiB/40 layers) for
-            # BF16 (~21.5 GiB) — still well inside the device budget.
+            # BF16 (~21.5 GiB) - still well inside the device budget.
             # npu_format_cast(ND) first: checkpoint-loaded f8 tensors may
             # carry NZ format metadata, and a dtype conversion on such a
             # tensor aborted the process (-9).
@@ -1490,10 +1574,10 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # budget 88.67). The remainder of this function (NZ cast +
             # Parameter(transpose)) runs on the BF16 tensor; the GEMM path's
             # deq branch reads the cache below (same data_ptr as the new
-            # Parameter's storage only if keyed before replacement — so key
+            # Parameter's storage only if keyed before replacement - so key
             # on the NEW tensor's data_ptr at GEMM time via dtype check).
             weight = w_bf16  # replaces the FP8 tensor; old storage freed on rebind
-            # Drop the FP8 checkpoint scale too — nothing reads it on this path.
+            # Drop the FP8 checkpoint scale too - nothing reads it on this path.
             setattr(layer, f"{weight_prefix}_weight_scale", Parameter(
                 torch.empty(0, device=w_bf16.device, dtype=torch.uint8),
                 requires_grad=False,
@@ -1505,7 +1589,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # aclnnGroupedMatmulV5 asserts x.dim1 == weight.dim1 (K), so the
             # bf16 ND path needs the SAME [E, K, N] orientation as the FP8
             # path: w13 ([E, 1024, 2048] → t → [E, 2048, 1024]) is
-            # transposed; w2 is natively [E, K=2048, N=512] already —
+            # transposed; w2 is natively [E, K=2048, N=512] already -
             # transposing it (v17b) flipped K/N and broke the shape assert.
             weight = weight.transpose(1, 2)  # [E, N, K] → [E, K, N] for both w13 and w2
             setattr(
@@ -1518,7 +1602,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         weight = npu_format_cast(weight)
 
         # Both paths hand the grouped matmul weight [E, K, N] and scale
-        # [E, K//64, N, 2] as strided transpose views — DO NOT call
+        # [E, K//64, N, 2] as strided transpose views - DO NOT call
         # .contiguous(). Beyond breaking the transpose-flag match above, it
         # measures slower on the same probe: making both sides contiguous costs
         # 6.2% on decode. This matches NPUMXFP8LinearMethod and msmodelslim's
@@ -1579,7 +1663,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             quant_mode=2,
             dequant_dtype=torch.float32,
             quant_dtype=torch.float8_e4m3fn,
-            # e4m3 is implicit for these two — it is not in the op's QUANT_DTYPES.
+            # e4m3 is implicit for these two - it is not in the op's QUANT_DTYPES.
             x_dtype=None,
             weight_dtype=None,
             weight_scale_dtype=e8m0_dtype,

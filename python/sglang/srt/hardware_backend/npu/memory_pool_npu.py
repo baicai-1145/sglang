@@ -295,17 +295,42 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
         else:
             loc = loc.to(torch.int32)
-            torch_npu._npu_reshape_and_cache(
-                key=cache_k,
-                value=cache_v,
-                key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.head_dim
-                ),
-                value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.v_head_dim
-                ),
-                slot_indices=loc,
-            )
+            # torch_npu._npu_reshape_and_cache routes through the atb layer,
+            # whose executor cache corrupts on free after NPUGraph capture
+            # (aclOpExecutor::~aclOpExecutor use-after-free, SIGSEGV at exit
+            # — reproduced offline with a single op). npu_scatter_nd_update_
+            # is the graph-safe equivalent already used by the FIA branch.
+            if getattr(self, "_use_scatter_kv_write", True):
+                num_rows = loc.numel()
+                k_rows = cache_k.reshape(num_rows, self.head_num, self.head_dim)
+                v_rows = cache_v.reshape(num_rows, self.head_num, self.v_head_dim)
+                loc_indices = loc.contiguous().view(-1, 1)
+                torch_npu.npu_scatter_nd_update_(
+                    self.k_buffer[layer_id - self.start_layer].view(
+                        -1, self.head_num, self.head_dim
+                    ),
+                    loc_indices,
+                    k_rows.contiguous(),
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    self.v_buffer[layer_id - self.start_layer].view(
+                        -1, self.head_num, self.v_head_dim
+                    ),
+                    loc_indices,
+                    v_rows.contiguous(),
+                )
+            else:
+                torch_npu._npu_reshape_and_cache(
+                    key=cache_k,
+                    value=cache_v,
+                    key_cache=self.k_buffer[layer_id - self.start_layer].view(
+                        -1, self.page_size, self.head_num, self.head_dim
+                    ),
+                    value_cache=self.v_buffer[layer_id - self.start_layer].view(
+                        -1, self.page_size, self.head_num, self.v_head_dim
+                    ),
+                    slot_indices=loc,
+                )
 
     def set_kv_buffer_prefix_valid(
         self,
