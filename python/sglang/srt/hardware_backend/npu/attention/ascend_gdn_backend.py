@@ -259,6 +259,28 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
+        if _os.environ.get("DRAMA3_DUMP_GDNSTEP") and int(layer.layer_id) == 0:
+            # GDN decode 数值取证: 首个 GDN 层 (L0), 前 40 步, dump kernel 全输入+输出+状态
+            _st = int(getattr(self, "_gdn_dump_step", 0))
+            if _st < 40:
+                import torch as _t
+                _t.save({
+                    "step": _st,
+                    "q": query.detach().float().cpu(),
+                    "k": key.detach().float().cpu(),
+                    "v": value.detach().float().cpu(),
+                    "a": a.detach().float().cpu(),
+                    "b": b.detach().float().cpu(),
+                    "A_log": layer.A_log.detach().float().cpu(),
+                    "dt_bias": layer.dt_bias.detach().float().cpu(),
+                    "state_pre": ssm_states[cache_indices].detach().float().cpu(),
+                    "out": core_attn_out.detach().float().cpu(),
+                    "cidx": cache_indices.detach().cpu(),
+                }, f"/workspace/drama3-work/.tmp/gdnstep_{_st:03d}.pt")
+                if _st == 0:
+                    print(f"[gdn-dump] L0 step0 saved q{tuple(query.shape)} k{tuple(key.shape)} v{tuple(value.shape)} a{tuple(a.shape)}", flush=True)
+                self._gdn_dump_step = _st + 1
+
         if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
             print(
                 f"[drama3] decode L{layer.layer_id}: q_nan={bool(query.isnan().any())} "
