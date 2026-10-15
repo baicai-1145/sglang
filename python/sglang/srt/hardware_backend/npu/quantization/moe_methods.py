@@ -1526,6 +1526,52 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
                     group_list_type=group_list_type,
                     output_dtype=output_dtype,
                 )[0]
+        import os as _od
+        if _od.environ.get("DRAMA3_MOE_DUMP") and weight_prefix == "w13":
+            # One-shot dump of the REAL serving w13 kernel inputs/output so
+            # the exact tensors can be replayed offline. First call only.
+            key = ("moe_dump",)
+            if key not in NPUMXFP8MoEMethod._deq_cache:
+                NPUMXFP8MoEMethod._deq_cache[key] = True
+                import torch as _t
+                _t.save(
+                    {
+                        "q": hidden_states.detach().cpu(),
+                        "xs": x_scale.detach().cpu(),
+                        "et": expert_tokens.detach().cpu(),
+                        "glt": int(group_list_type),
+                    },
+                    "/workspace/drama3-work/.tmp/moe_dump_in.pt",
+                )
+                try:
+                    _sl = weight[0, :4, :4].detach().cpu()
+                    _sls = w_scale[0, :2, :2, :].detach().cpu()
+                    print(
+                        "[moe-dump] w13 meta: w shape=%s stride=%s contig=%s "
+                        "dtype=%s | ws shape=%s stride=%s contig=%s dtype=%s | "
+                        "q shape=%s stride=%s | et=%s glt=%s | w[0,:4,:4]=%s | ws[0,:2,:2,:]=%s"
+                        % (
+                            tuple(weight.shape), tuple(weight.stride()),
+                            weight.is_contiguous(), weight.dtype,
+                            tuple(w_scale.shape), tuple(w_scale.stride()),
+                            w_scale.is_contiguous(), w_scale.dtype,
+                            tuple(hidden_states.shape), tuple(hidden_states.stride()),
+                            expert_tokens.tolist()[:8], int(group_list_type),
+                            _sl.flatten().tolist(), _sls.flatten().tolist(),
+                        ),
+                        flush=True,
+                    )
+                except Exception as _e:
+                    print("[moe-dump] slice fail:", str(_e)[:80], flush=True)
+                try:
+                    import torch_npu as _npu
+                    _f = _npu.get_npu_format(weight)
+                    _fb = _npu.get_npu_format(weight._base) if getattr(weight, "_base", None) is not None else None
+                    print(f"[moe-dump] w13 ACL format: view={_f} base={_fb} "
+                          f"data_ptr={weight.data_ptr()} base_ptr={getattr(getattr(weight,'_base',None),'data_ptr',lambda:None)()}",
+                          flush=True)
+                except Exception as _e2:
+                    print("[moe-dump] fmt fail:", str(_e2)[:80], flush=True)
         out = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[weight],
@@ -1537,6 +1583,15 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             group_list_type=group_list_type,
             output_dtype=output_dtype,
         )[0]
+        import os as _od2
+        if _od2.environ.get("DRAMA3_MOE_DUMP") and weight_prefix == "w13":
+            key = ("moe_dump_out",)
+            if key not in NPUMXFP8MoEMethod._deq_cache:
+                NPUMXFP8MoEMethod._deq_cache[key] = True
+                import torch as _t
+                _t.save({"out": out.detach().cpu()},
+                        "/workspace/drama3-work/.tmp/moe_dump_out.pt")
+                print("[moe-dump] w13 output saved", flush=True)
         if _os.environ.get("DRAMA3_DEBUG_MOE_MID") and ref is not None:
             try:
                 rel = (
