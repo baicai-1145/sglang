@@ -1187,6 +1187,67 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # capture-safety probe: bypass the grouped matmul entirely
             shp = hidden_states.shape
             raise SystemExit(0) if False else None
+        if _os.environ.get("DRAMA3_MOE_W8A16"):
+            # W8A16: int8 weights [E,K,N] + bf16 per-channel scale [E,1,N];
+            # hidden_states arrives as BF16 (this branch sits BEFORE the
+            # npu_dynamic_mx_quant call below, so activations never quantise).
+            # aclnnGroupedMatmul rejects quantised weights in every layout,
+            # so loop the experts and call npu_weight_quant_batchmatmul per
+            # expert (~8us/call; topk8 x 2 projections ~ 128us/token).
+            w_i8 = getattr(quant_info, f"{weight_prefix}_weight")  # [E,K,N]
+            pc = getattr(quant_info, f"{weight_prefix}_weight_scale")  # [E,1,N]
+            hs = (
+                hidden_states
+                if hidden_states.dtype == torch.bfloat16
+                else (
+                    pertoken_scale.dequant_mx(hidden_states)
+                    if False
+                    else hidden_states.to(torch.bfloat16)
+                )
+            )
+            # w13 path: hidden may be fp8+scale from the dispatcher — that
+            # only happens after apply_fused_gmm1_swiglu which this env never
+            # takes; assert defensively instead of silently requantising.
+            assert hs.dtype == torch.bfloat16, (
+                f"W8A16 expects bf16 activations, got {hs.dtype}"
+            )
+            E = w_i8.shape[0]
+            N_dim = w_i8.shape[-1]
+            if _os.environ.get("DRAMA3_DEBUG_W8A16"):
+                print(
+                    f"[w8a16] {weight_prefix}: w_i8={tuple(w_i8.shape)} "
+                    f"ptr={w_i8.data_ptr()} pc={tuple(pc.shape)} "
+                    f"hs={tuple(hs.shape)} "
+                    f"et={expert_tokens.tolist()[:4]} glt={group_list_type}",
+                    flush=True,
+                )
+            out = torch.empty(
+                hs.shape[0], N_dim, dtype=torch.bfloat16, device=hs.device
+            )
+            # expert_tokens_num_type=1 emits per-expert COUNTS, but the
+            # caller's group_list_type may be 1 (cumulative). Normalise:
+            # descending values => cumulative, diff them back to counts.
+            et = expert_tokens.to(torch.int64)
+            counts = (
+                torch.diff(et, prepend=torch.zeros(1, dtype=et.dtype, device=et.device))
+                .tolist()
+                if (et.numel() > 1 and bool((et[1:] >= et[:-1]).all())
+                    and int(et[-1]) == hs.shape[0])
+                else et.tolist()
+            )
+            row = 0
+            for e in range(E):
+                c = counts[e]
+                if c == 0:
+                    continue
+                xe = hs[row : row + c]
+                out[row : row + c] = torch.ops.npu.npu_weight_quant_batchmatmul(
+                    xe,
+                    w_i8[e],
+                    antiquant_scale=pc[e],
+                )
+                row += c
+            return out
         if _os.environ.get("DRAMA3_DEBUG_MOE_IDENTITY"):
             # capture-safety probe: replace the grouped matmul with a shape-
             # preserving matmul against a small slice (no ATB grouped op).
@@ -1323,6 +1384,76 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # 0.3% noise floor, bit-identical outputs. Set
         # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.
         import os as _os
+
+        if _os.environ.get("DRAMA3_MOE_W8A16"):
+            # W8A16: MX-FP8 -> int8 [E, K, N] + bf16 per-channel scale
+            # [E, 1, N]. Measured op support (CANN 9.1, 950PR):
+            # npu_weight_quant_batchmatmul accepts int8[K,N] weights with
+            # bf16 [1,N] per-channel scales (grouped antiquant rejects any
+            # quantised weight, and fp8+perchannel measures 2.75% vs int8
+            # 0.94%). Fold once at load: int8 = round(w_deq/amax_c*127).
+            w_nd0 = (
+                weight if weight.is_contiguous() else weight.contiguous()
+            )
+            w_f = torch.ops.npu.npu_format_cast(w_nd0, 2).to(torch.float32)
+            E_, N_, K_ = w_f.shape
+            # The offline path above already pair-split the scale to
+            # [E, N, K//64, 2] via a plain reshape (order-preserving view),
+            # so a plain reshape back to [E, N, K//32] restores sequential
+            # per-32 blocks — no permute needed.
+            if _os.environ.get("DRAMA3_DEBUG_W8A16"):
+                print(
+                    f"[w8a16-load] {weight_prefix}: w_f={tuple(w_f.shape)} "
+                    f"scale_in={tuple(scale.shape)}",
+                    flush=True,
+                )
+            scale_f = torch.exp2(
+                scale.reshape(E_, N_, K_ // 32).to(torch.float32) - 127.0
+            ).reshape(E_, N_, K_ // 32, 1)
+            w_deq = w_f.reshape(E_, N_, K_ // 32, 32) * scale_f  # [E,N,K] fp32
+            del w_f, scale_f, w_nd0
+            # per-channel (per output row N) amax; zero rows map to scale=1
+            # and an all-zero int8 row (lossless for the 55% sparse rows)
+            amax = (
+                w_deq.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
+            )  # [E,N,1,1] over the full K axis
+            w_i8 = torch.round(w_deq / amax * 127.0).clamp(
+                -127.0, 127.0
+            ).to(torch.int8).reshape(E_, N_, K_)  # [E, N, K]
+            pc_scale = (amax[..., 0, :] / 127.0).to(torch.bfloat16)  # [E,N,1]
+            amax = amax.reshape(E_, N_, 1)  # keep for del bookkeeping
+            del w_deq
+            # store as [E, K, N] (op wants K-major weight) and scale [E, 1, N]
+            _w_i8_final = (
+                w_i8.transpose(1, 2).contiguous()
+            )  # [E,K,N] 3-D
+            if _os.environ.get("DRAMA3_DEBUG_W8A16"):
+                print(
+                    f"[w8a16-store] {weight_prefix}: stored "
+                    f"{tuple(_w_i8_final.shape)} ptr={_w_i8_final.data_ptr()}",
+                    flush=True,
+                )
+            setattr(
+                layer,
+                f"{weight_prefix}_weight",
+                Parameter(_w_i8_final, requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{weight_prefix}_weight_scale",
+                Parameter(
+                    pc_scale.transpose(1, 2).contiguous(),  # [E,1,N]
+                    requires_grad=False,
+                ),
+            )
+            # BF16 all the way: the dispatcher must NOT quantise activations
+            # to MXFP8, and the runner's swiglu stays in bf16 (the deq path's
+            # NPUSwigluMxfp8Quant._apply_activation bf16 branch already
+            # covers this under DRAMA3_MOE_DEQ_GEMM; reuse it via env).
+            if weight_prefix == "w13":
+                self._set_dispatcher_output_dtype(layer, "bf16")
+            _os.environ.setdefault("DRAMA3_MOE_DEQ_GEMM", "1")
+            return
 
         if _os.environ.get("DRAMA3_MOE_DEQ_GEMM"):
             # A/B experiment: dequantise NOW, while the weight is still a
