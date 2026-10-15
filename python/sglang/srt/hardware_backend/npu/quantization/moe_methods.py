@@ -1310,6 +1310,65 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # now a plain bf16 grouped matmul - numerically equivalent to
             # the pre-MXFP8 serving path. If mid/late-sequence drift
             # disappears under this flag, the W8A8 chain is the culprit.
+            #
+            # P2 probe (DRAMA3_MOE_MXSIM=1): keep the FULL MX activation
+            # roundtrip (npu_dynamic_mx_quant -> explicit dequant) so the
+            # format noise stays in, but the grouped matmul runs on bf16
+            # tensors - bypassing whatever per_token_scale interpretation
+            # the aclnn kernel applies. If MXSIM degrades like W8A8 did,
+            # the MX format itself is guilty; if it matches the deq
+            # baseline, the kernel's scale consumption is the bug.
+            if _os.environ.get("DRAMA3_MOE_MXSIM"):
+                if hidden_states.dtype in (torch.bfloat16, torch.float16):
+                    q, qs = torch.ops.npu.npu_dynamic_mx_quant(
+                        hidden_states.reshape(-1, hidden_states.shape[-1]),
+                        dst_type=torch.float8_e4m3fn,
+                    )
+                    M_, K_ = q.shape
+                    # uint8 e8m0 exponent -> power-of-two scale via int
+                    # arithmetic (a .to(f32) on the strided view trips
+                    # aclnnInplaceCopy 561103 on NZ-format tensors).
+                    xs_f = (
+                        qs.reshape(-1).view(torch.uint8)
+                        .to(torch.int32)
+                        .sub(127)
+                        .to(torch.float32)
+                        if qs.dtype == torch.uint8
+                        else qs.reshape(-1).to(torch.float32)
+                    )
+                    scale_f = torch.exp2(xs_f).reshape(M_, K_ // 32, 1)
+                    hidden_states = (
+                        (
+                            q.to(torch.float32).reshape(M_, K_ // 32, 32)
+                            * scale_f
+                        )
+                        .reshape(M_, K_)
+                        .to(torch.bfloat16)
+                    )
+                elif hidden_states.dtype == torch.float8_e4m3fn and pertoken_scale is not None:
+                    # w2 input already fp8+scale (swiglu_group_quant path):
+                    # dequantise with the same interpretation the deq branch
+                    # uses, then fall through to the bf16 grouped matmul.
+                    xs = pertoken_scale
+                    xs_f = (
+                        xs.view(torch.float8_e8m0fnu).to(torch.float32)
+                        if xs.dtype == torch.uint8
+                        else xs.to(torch.float32)
+                    )
+                    M_, K_ = hidden_states.shape
+                    scale_f = torch.exp2(
+                        xs_f.reshape(M_, -1) - 127.0
+                    ).reshape(M_, K_ // 32, 1)
+                    hidden_states = (
+                        (
+                            hidden_states.to(torch.float32).reshape(
+                                M_, K_ // 32, 32
+                            )
+                            * scale_f
+                        )
+                        .reshape(M_, K_)
+                        .to(torch.bfloat16)
+                    )
             deq = getattr(quant_info, f"{weight_prefix}_weight")
             hidden_bf16 = (
                 hidden_states
@@ -1368,7 +1427,106 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             if weight_scale.dtype == torch.uint8
             else weight_scale
         )
-        return torch.ops.npu.npu_grouped_matmul(
+        if _os.environ.get("DRAMA3_DEBUG_MOE_MID"):
+            # Capture-safety probe: dump per-op inputs and the kernel output
+            # rel-err vs a manual bf16 dequant reference computed on device.
+            # One-shot per (prefix, shape) to keep logs bounded.
+            import torch as _t
+            key = (weight_prefix, tuple(hidden_states.shape))
+            seen = getattr(self, "_mid_seen", None)
+            if seen is None:
+                seen = self._mid_seen = set()
+            if key not in seen:
+                seen.add(key)
+                try:
+                    xf = (
+                        hidden_states.to(_t.float32).reshape(
+                            hidden_states.shape[0], -1, 32
+                        )
+                        * _t.exp2(
+                            x_scale.reshape(-1)
+                            .view(_t.uint8)
+                            .to(_t.int32)
+                            .sub(127)
+                            .to(_t.float32)
+                        ).reshape(
+                            hidden_states.shape[0],
+                            hidden_states.shape[1] // 32,
+                            1,
+                        )
+                    ).reshape(hidden_states.shape)
+                    wf = weight.to(_t.float32).reshape(
+                        weight.shape[0], weight.shape[1], -1, 32
+                    )
+                    wsc = _t.exp2(
+                        w_scale.reshape(weight.shape[0], -1)
+                        .view(_t.uint8)
+                        .to(_t.int32)
+                        .sub(127)
+                        .to(_t.float32)
+                    ).reshape(
+                        weight.shape[0],
+                        weight.shape[1],
+                        weight.shape[2] // 32,
+                        1,
+                    )
+                    w_deq = (wf * wsc).reshape(weight.shape)
+                    # reference: per-expert bf16 gemm on dequantised tensors
+                    # capture-safe reference: one grouped matmul on the
+                    # dequantised bf16 tensors (bf16 path is verified good)
+                    ref = torch.ops.npu.npu_grouped_matmul(
+                        x=[xf.to(_t.bfloat16).contiguous()],
+                        weight=[w_deq.to(_t.bfloat16).contiguous()],
+                        group_list=expert_tokens.to(_t.int64),
+                        split_item=2,
+                        group_type=0,
+                        group_list_type=group_list_type,
+                        output_dtype=_t.float32,
+                    )[0]
+                except Exception as _e:
+                    ref = None
+                    print(f"[moe-mid] {weight_prefix} ref-fail: {str(_e)[:120]}", flush=True)
+        import os as _o2
+        if _o2.environ.get("DRAMA3_MOE_W8A8_CONTIG"):
+            weight = weight.contiguous()
+            w_scale = w_scale.contiguous()
+        if _o2.environ.get("DRAMA3_MOE_W8A8_HALFDEQ"):
+            # P6/P7 probe: swap ONE projection's fp8 weight for the exact
+            # dequantised bf16 (from the verified-good deq cache) to bisect
+            # which of w13/w2 carries the residual fp8-kernel error.
+            # DRAMA3_MOE_W8A8_HALFDEQ=w13|w2|both
+            _hd = _o2.environ["DRAMA3_MOE_W8A8_HALFDEQ"]
+            if _hd in (weight_prefix, "both"):
+                # W8A8 mode stores fp8 + e8m0 scale - use the fp8 deq fold
+                # (_get_deq_bf16_weight), NOT the int8 one.
+                ckey = ("halfdeq", weight_prefix, id(quant_info))
+                w_bf16 = NPUMXFP8MoEMethod._deq_cache.get(ckey)
+                if w_bf16 is None:
+                    w_bf16 = self._get_deq_bf16_weight(quant_info, weight_prefix)
+                    if w_bf16.device != hidden_states.device:
+                        w_bf16 = w_bf16.to(hidden_states.device)
+                    # w13 checkpoint is [E,N,K] so the fold output is
+                    # [E,N,K] and needs the transpose; w2 checkpoint is
+                    # already K-major and the fold output inherits that.
+                    if weight_prefix == "w13":
+                        w_bf16 = w_bf16.transpose(1, 2).contiguous()
+                    NPUMXFP8MoEMethod._deq_cache[ckey] = w_bf16
+                    # free the fp8 payload + scale this projection no
+                    # longer uses (the bf16 replacement is 2x the fp8
+                    # size; keeping both OOMs the stage)
+                    setattr(quant_info, f"{weight_prefix}_weight", None)
+                    setattr(quant_info, f"{weight_prefix}_weight_scale", None)
+                    torch.npu.empty_cache()
+                return torch.ops.npu.npu_grouped_matmul(
+                    x=[hidden_states.to(torch.bfloat16)],
+                    weight=[w_bf16],
+                    group_list=expert_tokens.to(torch.int64),
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    output_dtype=output_dtype,
+                )[0]
+        out = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[weight],
             per_token_scale=[x_scale],
@@ -1379,6 +1537,19 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             group_list_type=group_list_type,
             output_dtype=output_dtype,
         )[0]
+        if _os.environ.get("DRAMA3_DEBUG_MOE_MID") and ref is not None:
+            try:
+                rel = (
+                    (out.float() - ref).norm() / ref.norm()
+                ).item()
+                print(
+                    f"[moe-mid] {weight_prefix} shape={tuple(hidden_states.shape)} "
+                    f"W={tuple(weight.shape)} glt={group_list_type} rel={rel*100:.2f}%",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[moe-mid] {weight_prefix} cmp-fail: {str(_e)[:100]}", flush=True)
+        return out
 
     @staticmethod
     def _quantize_weight_online(
@@ -1623,7 +1794,16 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
             # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
             # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
-            dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
+            # P5 probe (DRAMA3_MOE_W8A8_BF16DISP): keep the dispatcher in bf16
+            # mode so w13 quantises activations in _gmm_unfused instead -
+            # isolates the routing-fused MX quant path.
+            import os as _o3
+            if _o3.environ.get("DRAMA3_MOE_W8A8_BF16DISP"):
+                dispatcher_dtype = "bf16"
+            else:
+                dispatcher_dtype = (
+                    "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
+                )
             self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
 
 

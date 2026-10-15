@@ -241,6 +241,20 @@ class NPUSwigluMxfp8Quant(BaseActivation):
     ):
         import os as _os
 
+        if _os.environ.get("DRAMA3_MOE_MX_DYNQUANT"):
+            # P3a probe: bypass swiglu_group_quant entirely - plain torch
+            # swiglu in bf16, then requantise with npu_dynamic_mx_quant (the
+            # SAME op/params the offline probes verified correct). If output
+            # quality recovers, swiglu_group_quant's fp8+scale output (its
+            # scale layout/consumption by the w2 grouped matmul) is the bug.
+            g, u = hidden_states.chunk(2, dim=-1)
+            act = (torch.nn.functional.silu(g.float()) * u.float()).to(
+                torch.bfloat16
+            )
+            q, s = torch.ops.npu.npu_dynamic_mx_quant(
+                act.reshape(-1, act.shape[-1]), dst_type=torch.float8_e4m3fn
+            )
+            return q.reshape(act.shape), s.reshape(act.shape[0], -1, 2)
         if _os.environ.get("DRAMA3_MOE_DEQ_GEMM"):
             # Deq A/B: w2 consumes BF16 directly, so a plain torch swiglu is
             # exact AND removes the swiglu_group_quant ATB call (whose first
