@@ -35,6 +35,14 @@ class AscendTPDispatchOutput(NamedTuple):
     expert_tokens: torch.Tensor
     group_list_type: int
 
+    # The triton MoE runner reads this optional pre-quantized activation
+    # (per-token-group-128 fp8 q + scales); the Ascend TP dispatcher never
+    # pre-quantizes, so report None and let the runner quantize inside
+    # invoke_fused_moe_kernel.
+    @property
+    def hidden_states_pre_quant(self):
+        return None
+
     @property
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.ASCEND_TP

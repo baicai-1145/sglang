@@ -239,6 +239,15 @@ class NPUSwigluMxfp8Quant(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
+        import os as _os
+
+        if _os.environ.get("DRAMA3_MOE_DEQ_GEMM"):
+            # Deq A/B: w2 consumes BF16 directly, so a plain torch swiglu is
+            # exact AND removes the swiglu_group_quant ATB call (whose first
+            # in-capture setup segfaults atb::AclnnExecutorCache::AddCacheSlot).
+            g, u = hidden_states.chunk(2, dim=-1)
+            act = torch.nn.functional.silu(g.float()) * u.float()
+            return act.to(hidden_states.dtype), None
         # The op sums the group list as per-expert counts and has no cumulative layout;
         # a cusum list passed through would silently process the wrong rows.
         if group_list_type != 1:

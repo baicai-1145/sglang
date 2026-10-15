@@ -1008,6 +1008,9 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # Ascend 950 (CANN 9.1): aclnnGroupedMatmulSwigluQuantV2 fails its
+    # outputScale dim assert — force the unfused MXFP8 gmm1 path.
+    SGLANG_NPU_DISABLE_MXFP8_FUSED_GMM1 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.

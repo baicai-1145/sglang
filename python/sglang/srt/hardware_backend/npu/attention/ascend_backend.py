@@ -334,6 +334,10 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        # The aclnn paged attention ops require a block table whose page size
+        # is a multiple of 16 in [16, 512]; a finer page (e.g. the frame-level
+        # page_size=1 the Drama 3 tower needs) must fall back to torch sdpa.
+        self.use_native_sdpa = self.page_size % 16 != 0 or not (16 <= self.page_size <= 512)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -2692,6 +2696,81 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
 
+    def _graph_safe_sdpa_decode(self, q, layer, forward_batch):
+        import os as _os
+
+        if _os.environ.get("DRAMA3_DEBUG_ATTN_ZERO"):
+            out = torch.zeros(
+                q.shape[0], layer.tp_q_head_num * layer.v_head_dim,
+                dtype=q.dtype, device=q.device,
+            )
+            return out
+        """Graph-capturable sdpa for fine-page (page_size<16) decode.
+
+        Gathers each request's KV into a fixed [bs, MAX_KV] window using a
+        device-built index matrix, then runs one batched sdpa with padding
+        masked out. No .item()/host sync — capture-safe.
+        """
+        MAX_KV = min(int(self.req_to_token_pool.req_to_token.shape[1]), 2048)
+        bs = forward_batch.req_pool_indices.shape[0]
+        Hq, D = layer.tp_q_head_num, layer.qk_head_dim
+        Hk = layer.tp_k_head_num
+        Hv, Dv = layer.tp_v_head_num, layer.v_head_dim
+
+        seq_lens = forward_batch.seq_lens[:bs].to(q.device)  # exact bs rows
+        # arange window [MAX_KV]; token index = pos if pos < seq_len else 0
+        pos = torch.arange(MAX_KV, device=q.device, dtype=seq_lens.dtype)
+        valid = pos.unsqueeze(0) < seq_lens.clamp(min=1).unsqueeze(1)  # [bs, MAX_KV]
+        safe_len = seq_lens.clamp(min=1).unsqueeze(1)
+        kv_idx = torch.minimum(pos.unsqueeze(0), safe_len - 1)  # [bs, MAX_KV]
+        base = forward_batch.req_pool_indices.to(torch.int64).unsqueeze(1)
+        tokens = self.req_to_token_pool.req_to_token.gather(
+            1, base + kv_idx
+        ).clamp(min=0)  # [bs, MAX_KV] token ids (clamped: padded rows masked)
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, Hk, D
+        )
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            -1, Hv, layer.v_head_dim
+        )
+        K = k_cache[tokens].transpose(1, 2)  # [bs, Hk, MAX_KV, D]
+        V = v_cache[tokens].transpose(1, 2)  # [bs, Hv, MAX_KV, Dv]
+        Q = (
+            q.reshape(bs, Hq, D)
+            .unsqueeze(2)
+            .to(K.dtype)
+        )  # [bs, Hq, 1, D]
+
+        mask = (~valid).unsqueeze(1).unsqueeze(2).expand(
+            bs, Hq, 1, MAX_KV
+        )  # [bs,Hq,1,MAX_KV] True=pad — explicit mask.
+        # Explicit math instead of sdpa(): the NPU sdpa kernel rejects
+        # q_len(1) != kv_len(MAX_KV) at dim 2 ("size 16 vs 2048" surfaced as
+        # the head count when implicit broadcast was also in play). Manual
+        # scores/mask/softmax is shape-exact and capture-safe.
+        if not (Q.shape[0] == K.shape[0] == V.shape[0] == mask.shape[0]):
+            raise RuntimeError(
+                f"gather-sdpa shape mismatch: Q{tuple(Q.shape)} K{tuple(K.shape)} "
+                f"V{tuple(V.shape)} mask{tuple(mask.shape)} MAX_KV={MAX_KV} "
+                f"Hq={Hq} Hk={Hk} bs={bs}"
+            )
+        # einsum (not matmul): NPU matmul refuses implicit length broadcast
+        # between the q window (1) and kv window (MAX_KV); einsum contracts
+        # the head dim explicitly.
+        # GQA expand: tower attention has Hq=16 query heads but only Hk=2
+        # kv heads — repeat K/V heads up to Hq before the einsum (NPU
+        # matmul/sdpa reject both length and head broadcast).
+        rep = Hq // Hk
+        if rep > 1:
+            K = K.repeat_interleave(rep, dim=1)
+            V = V.repeat_interleave(rep, dim=1)
+        scores = torch.einsum("bhqd,bhkd->bhqk", Q, K) * layer.scaling
+        scores = scores.masked_fill(mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.einsum("bhqk,bhkd->bhqd", probs, V)  # [bs, Hq, 1, Dv]
+        return out.reshape(bs, Hq * Dv)
+
     def forward_decode_graph(
         self,
         q: torch.Tensor,
@@ -2808,6 +2887,14 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_k_head_num,
                 )
                 return attn_out
+
+        if not self.use_mla and getattr(self, "use_native_sdpa", False):
+            # page_size < 16 (e.g. Drama 3 tower page_size=1) cannot feed the
+            # aclnnFusedInferAttentionScore paged path (block_size must be a
+            # multiple of 16), and the eager sdpa fallback calls .item() which
+            # is illegal inside graph capture — use a graph-safe batched-gather
+            # sdpa: fixed max-KV window, device-side masking, no host sync.
+            return self._graph_safe_sdpa_decode(q, layer, forward_batch)
 
         if not self.use_mla:
             seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
@@ -3180,7 +3267,11 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
-            elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
+            elif (
+                forward_batch.encoder_lens is None
+                and layer.logit_cap == 0
+                and not getattr(self, "use_native_sdpa", False)
+            ):
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:

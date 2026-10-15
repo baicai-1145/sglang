@@ -532,12 +532,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 elif _is_npu:
-                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
-                        fused_sigmoid_mul_broadcast,
-                    )
-
                     gate = self.shared_expert_gate(hidden_states)
-                    shared_output = fused_sigmoid_mul_broadcast(shared_output, gate)
+                    try:
+                        from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                            fused_sigmoid_mul_broadcast,
+                        )
+
+                        shared_output = fused_sigmoid_mul_broadcast(shared_output, gate)
+                    except ImportError:
+                        shared_output = F.sigmoid(gate) * shared_output
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))

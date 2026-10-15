@@ -250,7 +250,20 @@ class BaseRunner(ABC):
             return
         mr._kernel_warmed_up = True
 
-        if mr.device != "cuda":
+        if mr.device == "npu":
+            # Ascend: ATB-backed ops (grouped_matmul, swiglu_group_quant…)
+            # lazily build their AclnnExecutorCache slot on first call — and
+            # that setup SEGFAULTS when it first happens inside a graph
+            # capture (atb::AclnnRunner::SetupImpl → AddCacheSlot → crash).
+            # Prime the cache eagerly here, before any capture begins.
+            print("[npu-warmup] entering NPU ATB prewarm", flush=True)
+            try:
+                self._prewarm_npu_atb_ops()
+                print("[npu-warmup] ATB prewarm done", flush=True)
+            except Exception as exc:  # pragma: no cover
+                print(f"[npu-warmup] ATB prewarm skipped: {exc}", flush=True)
+            return
+        elif mr.device != "cuda":
             return
 
         self._pre_initialize_flashinfer_allreduce_workspace()
@@ -284,6 +297,58 @@ class BaseRunner(ABC):
             )
 
             pp_parallel_deep_gemm_warmup(self)
+
+    def _prewarm_npu_atb_ops(self) -> None:
+        """Eagerly invoke ATB-backed grouped ops once to populate the
+        AclnnExecutorCache before NPU graph capture (in-capture first setup
+        segfaults). Tiny shapes are enough to create the cache slot."""
+        import torch
+        import torch_npu  # noqa: F401
+
+        mr = self.model_runner
+        dev = f"npu:{mr.gpu_id}"
+        # Grouped matmul (both dequant-BF16 and MXFP8 flavours route through
+        # aclnnGroupedMatmulV5 / ATB runner).
+        # Production shapes (Drama-3 MoE): w13 [E,2I,H]→[E,K,N] and w2
+        # [E,H,I]→[E,K,N]; decode x rows = capture bs (1..8). The ATB cache
+        # slot is keyed by shape/stride — tiny probes miss the production
+        # entry, so warm EVERY shape the graphs will capture.
+        E, H, I = 128, 2048, 512
+        gl0 = torch.ones(E, dtype=torch.int64, device=dev)
+        for rows in (1, 2, 4, 8):
+            x13 = torch.randn(rows, H, dtype=torch.bfloat16, device=dev)
+            w13 = torch.randn(E, H, 2 * I, dtype=torch.bfloat16, device=dev)
+            gl13 = torch.full((E,), rows // E if rows >= E else 0,
+                              dtype=torch.int64, device=dev)
+            gl13[0] = max(rows, 1)
+            torch.ops.npu.npu_grouped_matmul(
+                x=[x13], weight=[w13], group_list=gl13,
+                split_item=2, group_type=0, group_list_type=1,
+                output_dtype=torch.bfloat16,
+            )
+            x2 = torch.randn(rows, I, dtype=torch.bfloat16, device=dev)
+            w2 = torch.randn(E, I, H, dtype=torch.bfloat16, device=dev)
+            gl2 = gl13
+            torch.ops.npu.npu_grouped_matmul(
+                x=[x2], weight=[w2], group_list=gl2,
+                split_item=2, group_type=0, group_list_type=1,
+                output_dtype=torch.bfloat16,
+            )
+        # swiglu_group_quant (ATB too): production decode shape rows×2I,
+        # per-expert count layout, MX quant mode 2 — same call signature as
+        # NPUSwigluMxfp8Quant._apply_activation.
+        for rows in (1, 2, 4, 8):
+            xin = torch.randn(rows, 2 * I, dtype=torch.bfloat16, device=dev)
+            gi = torch.zeros(E, dtype=torch.int64, device=dev)
+            gi[0] = rows
+            try:
+                torch.ops.npu.swiglu_group_quant(
+                    x=xin, group_index=gi, quant_mode=2,
+                    group_list_type=0, clamp_value=7.0,
+                )
+            except Exception as exc:
+                print(f"[npu-warmup] swiglu prewarm shape {rows}: {exc}", flush=True)
+        torch.npu.synchronize()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Allocate flashinfer allreduce workspaces; must run before CG capture

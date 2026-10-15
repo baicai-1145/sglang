@@ -19,9 +19,16 @@ if not is_cpu():
 
 if is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-        fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
-    )
+    try:
+        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
+            fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
+        )
+    except ImportError:
+        # Older sgl-kernel-npu wheels ship the non-optimized recurrent update
+        # under fused_sigmoid_gating_recurrent; same kernel family, slower path.
+        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update_npu as fused_sigmoid_gating_delta_rule_update,
+        )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
 elif is_cpu():

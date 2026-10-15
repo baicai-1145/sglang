@@ -730,6 +730,31 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # Ascend 950 (CANN 9.1): npu_quant_matmul's MXFP8/e8m0 layout returns
+        # garbage (leading NaN mid-stack), so dequantize dense block-FP8
+        # weights to bf16 and run plain matmul instead.
+        if _is_npu and self.w8a8_block_fp8_linear is not None:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (  # noqa: F401
+                npu_w8a8_mxfp8_linear,
+            )
+
+            block_n, block_k = self.weight_block_size
+            weight = layer.weight.data
+            scale = layer.weight_scale_inv.data
+            n, k = weight.shape
+            scale_full = (
+                scale.to(torch.float32)
+                .repeat_interleave(block_n, dim=0)
+                .repeat_interleave(block_k, dim=1)[:n, :k]
+            )
+            layer.weight.data = (
+                (weight.to(torch.float32) * scale_full).to(torch.bfloat16).contiguous()
+            )
+            layer.weight_scale_inv = None
+            self.w8a8_block_fp8_linear = None
+            self.block_quant_dequant_bf16 = True
+            return
+
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -1218,6 +1243,14 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # NPU dequantized bf16 path: weights were expanded at load time.
+        if getattr(self, "block_quant_dequant_bf16", False):
+            input_tensor = x[0] if isinstance(x, tuple) else x
+            out = torch.nn.functional.linear(
+                input_tensor.to(layer.weight.dtype), layer.weight, bias
+            )
+            return out
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -1765,6 +1798,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if _is_npu:
+            # Block-FP8 experts dequantized to bf16: the NPU ASCEND runner was
+            # wired in create_moe_runner without block-scale GEMM support.
+            block_n, block_k = self.quant_config.weight_block_size
+            for prefix in ("w13", "w2"):
+                weight = getattr(layer, f"{prefix}_weight")
+                scale = getattr(layer, f"{prefix}_weight_scale_inv", None)
+                if scale is None or weight.dtype == torch.bfloat16:
+                    continue
+                num_experts = weight.shape[0]
+                bf16 = torch.empty(
+                    weight.shape, dtype=torch.bfloat16, device=weight.device
+                )
+                # Per-expert loop keeps the fp32 intermediate at one expert's
+                # size instead of the whole expert pool.
+                for e in range(num_experts):
+                    w = weight[e].to(torch.float32)
+                    s = (
+                        scale[e]
+                        .repeat_interleave(block_n, dim=0)
+                        .repeat_interleave(block_k, dim=1)
+                        .to(torch.float32)
+                    )
+                    bf16[e] = (w * s).to(torch.bfloat16)
+                layer.register_parameter(
+                    f"{prefix}_weight",
+                    torch.nn.Parameter(bf16, requires_grad=False),
+                )
+                delattr(layer, f"{prefix}_weight_scale_inv")
+            # The unquant kernels expect the experts in ACL FRACTAL_NZ format.
+            from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+            for prefix in ("w13", "w2"):
+                weight = getattr(layer, f"{prefix}_weight")
+                weight.data = npu_format_cast(weight.data)
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+            torch.npu.empty_cache()
+            return
+
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -2820,6 +2893,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
 
+        # Block-FP8 experts on NPU: the ascend MoE runner has no block-scale
+        # GEMM. process_weights_after_loading_block_quant dequantizes the
+        # experts to bf16, and the ASCEND runner runs the unquantized grouped
+        # GEMM path.
+        if _is_npu and self.block_quant and not self.is_fp4_expert:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUUnquantMoEMethod,
+            )
+
+            layer.w13_kernel = NPUUnquantMoEMethod()
+            layer.w2_kernel = NPUUnquantMoEMethod()
+            moe_runner_config.layer = layer
+            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+            logger.info(
+                "Fp8MoEMethod on NPU: block-fp8 experts will be dequantized to "
+                "bf16 (no block-scale MoE GEMM on this backend)"
+            )
+            return
+
         # MXFP4 experts on NPU run through the ASCEND runner, which
         # quantizes activations internally.
         if _is_npu and self.is_fp4_expert:
@@ -3210,6 +3302,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     else None
                 ),
                 activation_type=activation_type,
+            )
+        elif self.runner.runner_backend.is_ascend():
+            # NPU bf16 experts (block-fp8 dequantized at load): same payload
+            # the fp4 path hands the ASCEND runner.
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)

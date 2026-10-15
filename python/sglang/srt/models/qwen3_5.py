@@ -297,9 +297,14 @@ if _is_cpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
-        fused_sigmoid_mul as npu_fused_sigmoid_mul,
-    )
+    try:
+        from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+            fused_sigmoid_mul as npu_fused_sigmoid_mul,
+        )
+    except ImportError:
+        # Older sgl-kernel-npu wheels lack the fused kernel; the plain
+        # sigmoid-mul composition below is numerically identical.
+        npu_fused_sigmoid_mul = None
 
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
@@ -1056,6 +1061,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        import os as _os
+
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+            print(
+                f"[drama3] L{getattr(self, 'layer_id', '?')} in_proj: "
+                f"qkvz_nan={bool(projected_states_qkvz.isnan().any())} "
+                f"qkvz_max={float(projected_states_qkvz.abs().max()):.1f} "
+                f"ba_nan={bool(projected_states_ba.isnan().any())} "
+                f"mixed_nan={bool(mixed_qkv.isnan().any())}",
+                flush=True,
+            )
+
         attn_result = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -1212,6 +1229,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
 
         # Fully Connected
+        import os as _os
+
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+            hidden_states, tuple
+        ):
+            print(
+                f"[drama3] L{getattr(self, 'layer_id', '?')}-lin post-attn "
+                f"nan={bool(hidden_states.isnan().any())} "
+                f"absmax={float(hidden_states.abs().max()):.3f}",
+                flush=True,
+            )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
@@ -1224,6 +1252,15 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+            hidden_states, tuple
+        ):
+            print(
+                f"[drama3] L{getattr(self, 'layer_id', '?')}-lin post-mlp "
+                f"nan={bool(hidden_states.isnan().any())} "
+                f"absmax={float(hidden_states.abs().max()):.3f}",
+                flush=True,
+            )
         return ffn_exit.finish(hidden_states)
 
 
@@ -1580,9 +1617,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
-            else:
+            elif npu_fused_sigmoid_mul is not None:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
+            else:
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                attn_output = attn_output * torch.sigmoid(gate_val)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1611,6 +1651,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         # Fully Connected
+        import os as _os
+
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+            hidden_states, tuple
+        ):
+            print(
+                f"[drama3] L{self.layer_id}-attn post-attn "
+                f"nan={bool(hidden_states.isnan().any())} "
+                f"absmax={float(hidden_states.abs().max()):.3f}",
+                flush=True,
+            )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
@@ -1622,6 +1673,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+            hidden_states, tuple
+        ):
+            print(
+                f"[drama3] L{self.layer_id}-attn post-mlp "
+                f"nan={bool(hidden_states.isnan().any())} "
+                f"absmax={float(hidden_states.abs().max()):.3f}",
+                flush=True,
+            )
         return ffn_exit.finish(hidden_states)
 
 

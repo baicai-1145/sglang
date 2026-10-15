@@ -28,6 +28,29 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 )
 
 
+def _is_ascend_950() -> bool:
+    """True when running on an Ascend 950 (NpuArch 3510) device.
+
+    ``torch_npu.npu.get_soc_version()`` returns a raw enum int (no stable
+    public name mapping across CANN releases), so probe the chip via the
+    device property string once and cache it.
+    """
+    global _ASCEND_950_CACHE
+    if _ASCEND_950_CACHE is None:
+        try:
+            import torch_npu
+
+            _ASCEND_950_CACHE = "950" in str(
+                torch_npu.npu.get_device_properties(0)
+            )
+        except Exception:
+            _ASCEND_950_CACHE = False
+    return _ASCEND_950_CACHE
+
+
+_ASCEND_950_CACHE: Optional[bool] = None
+
+
 def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
     # The fused gmm1 kernel (npu_grouped_matmul_swiglu_quant_v2) applies plain
@@ -38,18 +61,15 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
 
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
-    if has_clamp:
-        # MXFP8 has no unfused gmm1 path at all, so a swiglu_limit
-        # checkpoint cannot be served by it.
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            raise NotImplementedError(
-                "NPUMXFP8MoEMethod has no unfused gmm1 path, and the fused "
-                "gmm1 kernel applies SiLU without clamp — a swiglu_limit "
-                "checkpoint cannot be served by this method."
-            )
-        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
     if isinstance(kernel, NPUMXFP8MoEMethod):
-        return True
+        # Ascend 950 (CANN 9.1, arch 3510): aclnnGroupedMatmulSwigluQuantV2
+        # fails its outputScale dim assert, so MXFP8 must run gmm1 unfused
+        # (plain grouped matmul + standard SwiGLU activation).
+        if envs.SGLANG_NPU_DISABLE_MXFP8_FUSED_GMM1.get():
+            return False
+        return False if _is_ascend_950() else True
+    if has_clamp:
+        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
     return kernel.use_fused_gmm1
 
 
