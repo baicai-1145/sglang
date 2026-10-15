@@ -370,6 +370,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 # history. Snapshot the raw input rows now; write the true
                 # trailing taps after the op returns.
                 x_rows_cache = mixed_qkv
+            import os as _os
+
+            _conv_input_snapshot = (
+                mixed_qkv.clone()
+                if _os.environ.get("DRAMA3_CONV_PREFILL_SAFE")
+                else None
+            )
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
@@ -382,17 +389,21 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 pad_slot_id=-1,
                 run_mode=0,
             )
-            import os as _os
-
-            if _os.environ.get("DRAMA3_CONV_PREFILL_SAFE"):
+            if _conv_input_snapshot is not None:
                 # The aclnn FN path (run_mode=0) intermittently emits NaN on
-                # multi-request batches even with finite inputs/states (seen
-                # at 217-token 7-request prefill; single-request batches are
-                # healthy). Detect and fall back to an exact torch conv.
+                # multi-request batches even with finite inputs/states. The
+                # op may also have written garbage into the state slice —
+                # recompute from the clean PRE-op input; the torch fallback
+                # rewrites the true trailing taps.
                 if bool(mixed_qkv.isnan().any()):
+                    print("[drama3] prefill conv NaN -> torch fallback", flush=True)
                     mixed_qkv = self._torch_conv1d_prefill(
-                        layer, mixed_qkv, query_start_loc, cache_indices,
-                        has_initial_states, conv_states,
+                        layer,
+                        _conv_input_snapshot,
+                        query_start_loc,
+                        cache_indices,
+                        has_initial_states,
+                        conv_states,
                     )
             if keep_native_hist:
                 k = kernel_size
