@@ -1007,7 +1007,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        import os as _ozg
+
+        if _ozg.environ.get("DRAMA3_GATED_NORM_TORCH"):
+            # graph-bisect: 纯 torch gated RMSNorm (z-gate on output side)
+            import torch as _tzg
+
+            _ep = float(getattr(self.norm, "eps", 1e-5))
+            _w = getattr(self.norm, "weight", None)
+            _nb = bool(getattr(self.norm, "norm_before_gate", True))
+            x = core_attn_out.float()
+            g = torch.nn.functional.silu(z.reshape(z.shape[0], -1).float()).reshape(
+                core_attn_out.shape
+            )
+            if _nb:
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + _ep)
+                if _w is not None:
+                    x = x * _w
+                x = x * g
+            else:
+                x = x * g
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + _ep)
+                if _w is not None:
+                    x = x * _w
+            core_attn_out = x.to(core_attn_out.dtype)
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -1155,7 +1180,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
-        core_attn_out = self.norm(core_attn_out, z)
+        import os as _ozg
+
+        if _ozg.environ.get("DRAMA3_GATED_NORM_TORCH"):
+            # graph-bisect: 纯 torch gated RMSNorm (z-gate on output side)
+            import torch as _tzg
+
+            _ep = float(getattr(self.norm, "eps", 1e-5))
+            _w = getattr(self.norm, "weight", None)
+            _nb = bool(getattr(self.norm, "norm_before_gate", True))
+            x = core_attn_out.float()
+            g = torch.nn.functional.silu(z.reshape(z.shape[0], -1).float()).reshape(
+                core_attn_out.shape
+            )
+            if _nb:
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + _ep)
+                if _w is not None:
+                    x = x * _w
+                x = x * g
+            else:
+                x = x * g
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + _ep)
+                if _w is not None:
+                    x = x * _w
+            core_attn_out = x.to(core_attn_out.dtype)
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],
