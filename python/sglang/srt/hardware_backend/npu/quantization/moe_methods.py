@@ -1527,7 +1527,19 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
                     output_dtype=output_dtype,
                 )[0]
         import os as _od
-        if _od.environ.get("DRAMA3_MOE_DUMP") and weight_prefix == "w13":
+
+        _gd_capturing = False
+        try:
+            import torch_npu as _tn
+
+            _gd_capturing = bool(_tn.npu.is_current_stream_capturing())
+        except Exception:
+            pass
+        if (
+            _od.environ.get("DRAMA3_MOE_DUMP")
+            and weight_prefix == "w13"
+            and not _gd_capturing
+        ):
             # One-shot dump of the REAL serving w13 kernel inputs/output so
             # the exact tensors can be replayed offline. First call only.
             key = ("moe_dump",)
@@ -1584,7 +1596,11 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             output_dtype=output_dtype,
         )[0]
         import os as _od2
-        if _od2.environ.get("DRAMA3_MOE_DUMP") and weight_prefix == "w13":
+        if (
+            _od2.environ.get("DRAMA3_MOE_DUMP")
+            and weight_prefix == "w13"
+            and not _gd_capturing
+        ):
             key = ("moe_dump_out",)
             if key not in NPUMXFP8MoEMethod._deq_cache:
                 NPUMXFP8MoEMethod._deq_cache[key] = True

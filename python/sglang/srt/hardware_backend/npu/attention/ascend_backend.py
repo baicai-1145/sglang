@@ -2906,12 +2906,19 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
-        if not self.use_mla and getattr(self, "use_native_sdpa", False):
+        import os as _osd
+
+        if not self.use_mla and (
+            getattr(self, "use_native_sdpa", False)
+            or _osd.environ.get("DRAMA3_ATTN_SDPA_ALL")
+        ):
             # page_size < 16 (e.g. Drama 3 tower page_size=1) cannot feed the
             # aclnnFusedInferAttentionScore paged path (block_size must be a
             # multiple of 16), and the eager sdpa fallback calls .item() which
             # is illegal inside graph capture — use a graph-safe batched-gather
             # sdpa: fixed max-KV window, device-side masking, no host sync.
+            # DRAMA3_ATTN_SDPA_ALL: bisect switch — force ALL full-attn decode
+            # (incl. the backbone's page-16 layers) through this torch path.
             return self._graph_safe_sdpa_decode(q, layer, forward_batch)
 
         if not self.use_mla:
