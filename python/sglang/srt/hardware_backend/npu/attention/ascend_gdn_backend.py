@@ -258,18 +258,47 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        core_attn_out = self.kernel_dispatcher.decode(
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-        )
+        import os as _ogd2
+        if _ogd2.environ.get("DRAMA3_GDN_DECODE_TORCH"):
+            # graph-bisect: 纯 torch 逐步 GDN (与 prefill torch 同公式), 无 triton.
+            # q/k/v: [1, bs, H, K] / [1, bs, HV, V]; a/b: [bs, HV]
+            import torch as _td
+            _q = query[0].float(); _k = key[0].float(); _v = value[0].float()
+            _a = a.float().reshape(-1, a.shape[-1]); _b = b.float().reshape(-1, a.shape[-1])
+            _H, _K = _q.shape[-2:]; _HV = _v.shape[-2]
+            _sc = _K ** -0.5
+            def _l2n(x):
+                return x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+            _qt = _l2n(_q) * _sc
+            _kt = _l2n(_k)
+            _rep = _HV // _H
+            _kt_hv = _kt.repeat_interleave(_rep, dim=-2)
+            _qt_hv = _qt.repeat_interleave(_rep, dim=-2)
+            _g = -torch.exp(layer.A_log.float()) * torch.nn.functional.softplus(
+                _a + layer.dt_bias.float()
+            )
+            _beta = torch.sigmoid(_b)
+            h = ssm_states[cache_indices].float()          # [bs, HV, K, V]
+            h = h * torch.exp(_g)[:, :, None, None]
+            Sk = torch.einsum('bhkv,bhk->bhv', h, _kt_hv)
+            u = _beta[:, :, None] * _v - Sk
+            h = h + torch.einsum('bhk,bhv->bhkv', _kt_hv, u)
+            o = torch.einsum('bhkv,bhk->bhv', h, _qt_hv)
+            ssm_states[cache_indices] = h.to(ssm_states.dtype)
+            core_attn_out = o.to(query.dtype).view(1, -1, _HV, _v.shape[-1])
+        else:
+            core_attn_out = self.kernel_dispatcher.decode(
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
 
 
         import os as _os

@@ -2718,14 +2718,32 @@ class AscendAttnBackend(AttentionBackend):
         Hv, Dv = layer.tp_v_head_num, layer.v_head_dim
 
         seq_lens = forward_batch.seq_lens[:bs].to(q.device)  # exact bs rows
+        # Graph replay pads rows past the real batch: stale req_pool_indices /
+        # seq_lens would push the gather past req_to_token's width (silent
+        # garbage on NPU). Clamp every derived index into safe range AND
+        # force padded rows' seq_len to 1 (kv_idx=0, single masked/dup token
+        # gather — output row discarded by the caller).
+        real_n = int(getattr(forward_batch, "_real_n_for_graph", bs))
+        row_valid = (
+            torch.arange(bs, device=q.device) < real_n
+            if bs != real_n
+            else torch.ones(bs, dtype=torch.bool, device=q.device)
+        )
+        seq_lens = torch.where(
+            row_valid, seq_lens, torch.ones_like(seq_lens)
+        )
         # arange window [MAX_KV]; token index = pos if pos < seq_len else 0
         pos = torch.arange(MAX_KV, device=q.device, dtype=seq_lens.dtype)
         valid = pos.unsqueeze(0) < seq_lens.clamp(min=1).unsqueeze(1)  # [bs, MAX_KV]
         safe_len = seq_lens.clamp(min=1).unsqueeze(1)
         kv_idx = torch.minimum(pos.unsqueeze(0), safe_len - 1)  # [bs, MAX_KV]
+        tbl_w = self.req_to_token_pool.req_to_token.shape[1]
         base = forward_batch.req_pool_indices.to(torch.int64).unsqueeze(1)
+        base = torch.where(
+            row_valid.unsqueeze(1), base, torch.zeros_like(base)
+        ).clamp(max=tbl_w - 1)
         tokens = self.req_to_token_pool.req_to_token.gather(
-            1, base + kv_idx
+            1, (base + kv_idx).clamp(max=tbl_w - 1)
         ).clamp(min=0)  # [bs, MAX_KV] token ids (clamped: padded rows masked)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
