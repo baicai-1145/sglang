@@ -128,17 +128,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             s, e = int(starts[i]), int(starts[i + 1])
             seg = x32[s:e]  # [L, dim]
             L = seg.shape[0]
-            acc = seg * w[k - 1]
-            for j in range(k - 1):
-                # taps from previous tokens (zero-padded at sequence start)
-                src_row = s + j
-                if src_row >= 0 and (i == 0 or src_row >= s):
-                    hist = (
-                        x32[src_row : src_row + max(L - 1 - j, 0)]
-                        if (L - 1 - j) > 0
-                        else x32[s : s]
-                    )
-                    acc[j + 1 :] = acc[j + 1 :] + hist * w[j]
+            # 正确 causal conv: y[m] = sum_{j=0..k-1} w[j] * x[m-k+1+j]
+            # (序列起点零填充); 旧实现的切片配对数学错误 (每个 tap 都对齐到
+            # x[m-1], 离线复刻 relerr 97% — 01:10 定罪修正).
+            pad = torch.zeros((k - 1, seg.shape[-1]), dtype=seg.dtype, device=seg.device)
+            padded = torch.cat([pad, seg], dim=0)   # [L+k-1, dim]
+            idx = torch.arange(L, device=seg.device).unsqueeze(1) + torch.arange(k, device=seg.device).unsqueeze(0)  # [L, k]
+            windows = padded[idx]                    # [L, k, dim]
+            acc = torch.einsum('lk,okd->od', w, windows) if False else (windows * w.unsqueeze(0)).sum(dim=1)
             if layer.bias is not None:
                 acc = acc + layer.bias.to(torch.float32)
             out[s:e] = torch.nn.functional.silu(acc)
