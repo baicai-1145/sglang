@@ -2762,8 +2762,23 @@ class AscendAttnBackend(AttentionBackend):
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1, Hv, layer.v_head_dim
         )
-        K = k_cache[tokens].transpose(1, 2)  # [bs, Hk, MAX_KV, D]
-        V = v_cache[tokens].transpose(1, 2)  # [bs, Hv, MAX_KV, Dv]
+        # ROOT-CAUSE FIX 2 (advanced-indexing gather on tensor tables also
+        # corrupts under NPUGraph replay — same family as embedding_bag and
+        # req_to_token.gather): flatten + index_select + reshape instead of
+        # k_cache[tokens] / v_cache[tokens].
+        _tk = tokens.reshape(-1)  # [bs*MAX_KV]
+        K = (
+            k_cache.reshape(k_cache.shape[0], -1)
+            .index_select(0, _tk)
+            .reshape(bs, MAX_KV, Hk, D)
+            .transpose(1, 2)
+        )  # [bs, Hk, MAX_KV, D]
+        V = (
+            v_cache.reshape(v_cache.shape[0], -1)
+            .index_select(0, _tk)
+            .reshape(bs, MAX_KV, Hv, Dv)
+            .transpose(1, 2)
+        )  # [bs, Hv, MAX_KV, Dv]
         Q = (
             q.reshape(bs, Hq, D)
             .unsqueeze(2)
@@ -2817,6 +2832,17 @@ class AscendAttnBackend(AttentionBackend):
                 )
             import torch as _tq2
 
+            if not _odg.environ.get("DRAMA3_IN_CAPTURE"):
+                _sv2 = int(getattr(self, "_attn_stride_dumped", 0))
+                if _sv2 == 0:
+                    self._attn_stride_dumped = 1
+                    print(
+                        f"[attn-fmt] k_cache stride={tuple(k_cache.stride())} "
+                        f"shape={tuple(k_cache.shape)} | v_cache stride={tuple(v_cache.stride())} "
+                        f"shape={tuple(v_cache.shape)} | k dtype={k_cache.dtype} v dtype={v_cache.dtype} "
+                        f"| Q stride={tuple(Q.stride())} K(strided)={tuple(K.stride())}",
+                        flush=True,
+                    )
             _p = self._attn_trace_ptr.clamp(max=31)
             w8 = getattr(self, "_attn_w8", None)
             if w8 is None or w8.device != q.device:
@@ -2827,9 +2853,12 @@ class AscendAttnBackend(AttentionBackend):
                     device=q.device,
                     dtype=_tw8.float32,
                 )
-            _k0 = K[0, 0, 0, :8].float()
-            _v0 = V[0, 0, 0, :8].float()
+            _s0 = int(seq_lens[0].item()) if not _odg.environ.get("DRAMA3_IN_CAPTURE") else 1
+            _s0 = max(_s0 - 1, 0)
+            _k0 = K[0, 0, _s0, :8].float()
+            _v0 = V[0, 0, _s0, :8].float()
             _o0 = out.reshape(bs, -1)[0, :8].float()
+            _kin = q.reshape(bs, -1)[0, :8].float()  # q 本身做写入侧参考
             _vals = torch.stack(
                 [
                     (_k0 * w8).sum(),
@@ -2838,8 +2867,8 @@ class AscendAttnBackend(AttentionBackend):
                     seq_lens[0].float(),
                     forward_batch.req_pool_indices[0].float(),
                     tokens[0, 0].float(),
-                    tokens[0, 1].float(),
-                    tokens[0, 2].float(),
+                    (_kin * w8).sum(),
+                    V[0, 0, :8, 0].float().sum(),
                 ]
             )  # [8]
             _dbg.index_put_(
@@ -2872,6 +2901,45 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
+                import os as _okvt
+
+                if _okvt.environ.get("DRAMA3_KV_WRITE_TRACE"):
+                    _vw = getattr(self, "_kvw_w8", None)
+                    if _vw is None or _vw.device != v.device:
+                        import torch as _tkv
+
+                        _vw = self._kvw_w8 = _tkv.tensor(
+                            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                            device=v.device,
+                            dtype=_tkv.float32,
+                        )
+                        self._kvw_buf = _tkv.zeros(
+                            32, 3, dtype=_tkv.float32, device=v.device
+                        )
+                        self._kvw_ptr = _tkv.zeros(
+                            1, dtype=_tkv.int32, device=v.device
+                        )
+                    import torch as _tkq
+
+                    _vf = v.detach().reshape(v.shape[0], -1)[0, :8].float()
+                    _kf = k.detach().reshape(k.shape[0], -1)[0, :8].float()
+                    _loc = (
+                        forward_batch.out_cache_loc[0].float()
+                        if forward_batch.out_cache_loc is not None
+                        else torch.zeros(1, device=v.device)
+                    )
+                    _pi2 = self._kvw_ptr.clamp(max=31)
+                    _vals2 = torch.stack(
+                        [(_vf * _vw).sum(), (_kf * _vw).sum(), _loc.reshape(1)[0]]
+                    )
+                    self._kvw_buf.index_put_(
+                        (
+                            _pi2.to(_tkq.int64),
+                            _tkq.arange(3, device=_vf.device, dtype=_tkq.int64),
+                        ),
+                        _vals2,
+                    )
+                    self._kvw_ptr.add_(1)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(
@@ -3215,6 +3283,41 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else None
                 )
+                import os as _okvt
+
+                if _okvt.environ.get("DRAMA3_KV_WRITE_TRACE"):
+                    _vw = getattr(self, "_kvw_w8", None)
+                    if _vw is None or _vw.device != v.device:
+                        import torch as _tkv
+
+                        _vw = self._kvw_w8 = _tkv.tensor(
+                            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                            device=v.device,
+                            dtype=_tkv.float32,
+                        )
+                        self._kvw_buf = _tkv.zeros(
+                            32, 3, dtype=_tkv.float32, device=v.device
+                        )
+                        self._kvw_ptr = _tkv.zeros(
+                            1, dtype=_tkv.int32, device=v.device
+                        )
+                    import torch as _tkq
+
+                    _vf = v.detach().reshape(v.shape[0], -1)[0, :8].float()
+                    _kf = k.detach().reshape(k.shape[0], -1)[0, :8].float()
+                    _loc = cache_loc[0].float() if cache_loc is not None else torch.zeros(1, device=v.device)
+                    _pi2 = self._kvw_ptr.clamp(max=31)
+                    _vals2 = torch.stack(
+                        [(_vf * _vw).sum(), (_kf * _vw).sum(), _loc.reshape(1)[0]]
+                    )
+                    self._kvw_buf.index_put_(
+                        (
+                            _pi2.to(_tkq.int64),
+                            _tkq.arange(3, device=_vf.device, dtype=_tkq.int64),
+                        ),
+                        _vals2,
+                    )
+                    self._kvw_ptr.add_(1)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, KVWriteLoc(cache_loc, swa_loc), k, v
                 )

@@ -206,6 +206,37 @@ def _set_kv_buffer_impl(
     from sglang.srt.model_executor.runner import get_is_capture_mode
     import os as _okv
 
+    if _okv.environ.get("DRAMA3_KV_WRITE_TRACE"):
+        _vw = globals().get("_KVW_W8", None)
+        if _vw is None or _vw.device != v.device:
+            import torch as _tkv
+
+            _vw = _KVW_W8 = _tkv.tensor(
+                [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                device=v.device,
+                dtype=_tkv.float32,
+            )
+            globals()["_KVW_BUF"] = _tkv.zeros(64, 3, dtype=_tkv.float32, device=v.device)
+            globals()["_KVW_PTR"] = _tkv.zeros(1, dtype=_tkv.int32, device=v.device)
+        import torch as _tkq2
+
+        _vf = v.detach().reshape(v.shape[0], -1)[0, :8].float()
+        _kf = k.detach().reshape(k.shape[0], -1)[0, :8].float()
+        _loc = indices[0].float() if indices is not None else torch.zeros(1, device=v.device)
+        _vals3 = torch.stack(
+            [(_vf * _vw).sum(), (_kf * _vw).sum(), _loc.reshape(1)[0]]
+        )
+        _buf3 = globals()["_KVW_BUF"]
+        _ptr3 = globals()["_KVW_PTR"].clamp(max=63)
+        _buf3.index_put_(
+            (
+                _ptr3.to(_tkq2.int64),
+                _tkq2.arange(3, device=_vf.device, dtype=_tkq2.int64),
+            ),
+            _vals3,
+        )
+        globals()["_KVW_PTR"].add_(1)
+
     # ROOT-CAUSE FIX (graph replay corruption): the alt-stream K/V dual-write
     # (k on the capture stream, v on a side stream fenced with wait_stream)
     # serialises wrongly under NPUGraph replay — the replayed v write can land
@@ -2847,6 +2878,20 @@ class MHATokenToKVPool(KVCache):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._check_physical_write_loc(loc_info, "set_kv_buffer (MHA)")
+        import os as _okv0
+
+        if _okv0.environ.get("DRAMA3_KV_WRITE_TRACE") and not _okv0.environ.get(
+            "DRAMA3_IN_CAPTURE"
+        ):
+            _s0 = int(getattr(self, "_kvw_seen", 0))
+            if _s0 < 2:
+                self._kvw_seen = _s0 + 1
+                print(
+                    f"[kvw] set_kv_buffer path: quant={self.is_quantized_kv_cache} "
+                    f"hnd={self.use_hnd} layout={self.kv_cache_layout} "
+                    f"store_dtype={self.store_dtype} k_dtype={cache_k.dtype}",
+                    flush=True,
+                )
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
@@ -2924,6 +2969,42 @@ class MHATokenToKVPool(KVCache):
                 return
             pages = loc // self.page_size
             offs = loc % self.page_size
+            import os as _okv2
+
+            if _okv2.environ.get("DRAMA3_KV_WRITE_TRACE"):
+                _vw2 = globals().get("_KVW_W8", None)
+                if _vw2 is None or _vw2.device != cache_v.device:
+                    import torch as _tkv2
+
+                    _vw2 = globals()["_KVW_W8"] = _tkv2.tensor(
+                        [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                        device=cache_v.device,
+                        dtype=_tkv2.float32,
+                    )
+                    globals()["_KVW_BUF"] = _tkv2.zeros(
+                        64, 3, dtype=_tkv2.float32, device=cache_v.device
+                    )
+                    globals()["_KVW_PTR"] = _tkv2.zeros(
+                        1, dtype=_tkv2.int32, device=cache_v.device
+                    )
+                import torch as _tkq3
+
+                _vf3 = cache_v.detach().reshape(cache_v.shape[0], -1)[0, :8].float()
+                _kf3 = cache_k.detach().reshape(cache_k.shape[0], -1)[0, :8].float()
+                _loc3 = loc[0].float() if loc is not None else torch.zeros(1, device=cache_v.device)
+                _vals4 = torch.stack(
+                    [(_vf3 * _vw2).sum(), (_kf3 * _vw2).sum(), _loc3.reshape(1)[0]]
+                )
+                _buf4 = globals()["_KVW_BUF"]
+                _ptr4 = globals()["_KVW_PTR"].clamp(max=63)
+                _buf4.index_put_(
+                    (
+                        _ptr4.to(_tkq3.int64),
+                        _tkq3.arange(3, device=_vf3.device, dtype=_tkq3.int64),
+                    ),
+                    _vals4,
+                )
+                globals()["_KVW_PTR"].add_(1)
             k_buf[pages, :, offs, :] = cache_k
             v_buf[pages, :, offs, :] = cache_v
             return
