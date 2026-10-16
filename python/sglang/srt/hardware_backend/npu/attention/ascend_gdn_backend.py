@@ -578,7 +578,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 }, "/workspace/drama3-work/.tmp/gdnext_in.pt")
                 print(f"[gdn-ext] FIRST GDN layer {layer.layer_id} dumped q{tuple(query.shape)} g{tuple(g.shape)} beta{tuple(beta.shape)}", flush=True)
             core_attn_out, last_recurrent_state, h = self.chunk_gdn(
-                query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
+                query, key, value, g, beta, ssm_states[cache_indices],
+                query_start_loc, has_initial_states=has_initial_states,
             )
             if _first_dump:
                 import torch as _tg2
@@ -619,6 +620,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         beta,
         initial_state,
         cu_seqlens,
+        has_initial_states=None,
     ):
         q = l2norm_fwd(q)  # [T, Nk, Dk]
         k = l2norm_fwd(k)  # [T, Nk, Dk]
@@ -673,10 +675,20 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             # (与 decode kernel 同公式: v_d = β·v − (h·e^g)·k; h += k⊗v_d;
             #  o = h·q·scale; 状态 [Nv, Dk, Dv] k行v列, fp32 累积).
             Nv_, Dk_, Dv_ = vf.shape[-2], kf.shape[-1], vf.shape[-1]
+            _init_flags = (
+                has_initial_states.tolist()
+                if hasattr(has_initial_states, "tolist")
+                else None
+            )
             for b, (s, e) in enumerate(seq_bounds):
                 # decode pool 布局 [Nv, K, V] (k行v列, exp_p 已证); aclnn doc
                 # 布局是 [Nv, Dv, Dk] — 交叉转置对齐 pool 惯例后演化.
-                h = state[b].to(torch.float32).transpose(1, 2).contiguous()  # [Nv, K, V]
+                # 新请求 (has_initial_states=False) 必须从零状态出发 — mamba
+                # 池 slot 不保证清零, 残留会污染整段 prefill (10 条 CER 首条
+                # 6.2% 其余 32-94% 的请求间退化即此).
+                _has_init = bool(_init_flags[b]) if _init_flags is not None and b < len(_init_flags) else False
+                h0_src = state[b] if _has_init else torch.zeros_like(state[b])
+                h = h0_src.to(torch.float32).transpose(1, 2).contiguous()  # [Nv, K, V]
                 for t in range(s, e):
                     qt = qf[t].to(torch.float32) * scale
                     kt = kf[t].to(torch.float32)
