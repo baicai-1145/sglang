@@ -850,6 +850,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and get_is_capture_mode()
             and not torch.compiler.is_compiling()
+            and not __import__("os").environ.get("DRAMA3_MOE_SINGLE_STREAM")
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,

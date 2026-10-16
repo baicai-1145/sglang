@@ -157,6 +157,25 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        import os as _orl
+
+        if _orl.environ.get("DRAMA3_TRACE_MAMBA_IDX") and not _orl.environ.get(
+            "DRAMA3_IN_CAPTURE"
+        ):
+            import torch as _trl
+
+            _mi = mamba_indices.to(torch.int64)
+            _rpi = req_pool_indices.to(torch.int64)
+            _map = self.req_to_token_pool.req_index_to_mamba_index_mapping
+            _st = self.state_indices_list[bs - 1][: len(mamba_indices)].to(
+                torch.int64
+            )
+            print(
+                f"[mamba-idx] bs={bs} req_pool={_rpi.tolist()} "
+                f"mi={_mi.tolist()} state_list={_st.tolist()} "
+                f"map[req]={_map[_rpi.clamp(min=0)].tolist()}",
+                flush=True,
+            )
         track_buf = None
         if mamba_track_indices is not None:
             track_buf = mamba_track_indices

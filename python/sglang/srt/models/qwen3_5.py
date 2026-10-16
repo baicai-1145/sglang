@@ -1709,13 +1709,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 o2 = x1 * s1 + x2 * c1
                 return torch.cat([o1, o2, x[..., r:]], dim=-1).to(x.dtype)
 
-            q = _rope(q, position_cos, position_sin)
-            k = _rope(k, position_cos, position_sin)
+            q = _rope(q, position_cos, position_sin).to(qkv.dtype)
+            k = _rope(k, position_cos, position_sin).to(qkv.dtype)
             return (
-                q.reshape(qkv.shape[0], -1),
-                k.reshape(qkv.shape[0], -1),
-                v.reshape(qkv.shape[0], -1),
-                gate,
+                q.reshape(qkv.shape[0], -1).contiguous(),
+                k.reshape(qkv.shape[0], -1).contiguous(),
+                v.reshape(qkv.shape[0], -1).contiguous(),
+                gate.contiguous(),
             )
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
