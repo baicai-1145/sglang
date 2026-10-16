@@ -200,6 +200,19 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         if _os.environ.get("SGLANG_NPU_GDN_NATIVE_CONV_DECODE"):
             w = self._get_conv_weights_t(layer).to(torch.float32)  # [k, dim]
             k = w.shape[0]
+            import os as _odc
+            if _odc.environ.get("DRAMA3_DUMP_CONVDEC") and int(layer.layer_id) == 0:
+                _st = int(getattr(self, "_convdec_dump_step", 0))
+                if _st < 40:
+                    import torch as _td
+                    _td.save({
+                        "step": _st,
+                        "x": mixed_qkv.detach().float().cpu(),        # conv 输入 (本 token)
+                        "hist": conv_states[cache_indices].detach().float().cpu(),  # 布局照抄
+                        "w": w.detach().float().cpu(),
+                        "bias": layer.bias.detach().float().cpu() if layer.bias is not None else None,
+                    }, f"/workspace/drama3-work/.tmp/convdec_{_st:03d}.pt")
+                    self._convdec_dump_step = _st + 1
             slots = cache_indices
             # NPU mamba pool conv_states layout per slot: [k-1, dim] (the
             # window axis is the FIRST one; observed at runtime).
