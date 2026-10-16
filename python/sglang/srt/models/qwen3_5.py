@@ -1078,9 +1078,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
         )
+        import os as _ouf
+
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
-        )
+        ) and not _ouf.environ.get("DRAMA3_QKVZBA_TORCH")
         if use_fused_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
@@ -1659,6 +1661,59 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         position_sin = sin.reshape(-1, 1, 1, last_dim)
         position_cos = cos.reshape(-1, 1, 1, last_dim)
 
+        import os as _osq
+
+        if _osq.environ.get("DRAMA3_SPLITQKV_TORCH"):
+            # graph-bisect: 纯 torch 拆包+qk-norm+rope+gate.
+            # 语义: q,k 各自 Gemma-RMSNorm (zero-centered gamma: (w+1)),
+            # partial rotary (前 rope_dim 转, 其余直通), gate 原样.
+            import torch as _tsq
+
+            rope_dim = int(self.head_dim * self.partial_rotary_factor)
+            qkv_f = qkv.reshape(qkv.shape[0], -1)
+            _hq = self.q_size // self.head_dim
+            _hk = self.num_kv_heads
+            q = qkv_f[:, : self.q_size].reshape(-1, _hq, self.head_dim)
+            k = qkv_f[
+                :, self.q_size : self.q_size + self.kv_size // 2
+            ].reshape(-1, _hk, self.head_dim)
+            v = qkv_f[
+                :, self.q_size + self.kv_size // 2 :
+            ].reshape(-1, _hk, self.head_dim)
+            gate = qkv_f[
+                :, self.q_size + self.kv_size : self.q_size + self.kv_size + self.q_size
+            ].reshape(-1, _hq, self.head_dim)
+
+            def _gemma_rms(x, w, eps):
+                xf = x.float()
+                var = xf.pow(2).mean(-1, keepdim=True)
+                xn = xf * torch.rsqrt(var + eps)
+                return xn * (w.float() + 1.0)
+
+            eps = self.q_norm.variance_epsilon
+            q = _gemma_rms(q, self.q_norm.weight, eps)
+            k = _gemma_rms(k, self.k_norm.weight, eps)
+
+            def _rope(x, cos, sin):
+                d = x.shape[-1]
+                r = rope_dim if rope_dim < d else d
+                x1, x2 = x[..., : r // 2], x[..., r // 2 : r]
+                c = cos[..., : r // 2].reshape(-1, 1, r // 2)
+                s2 = sin[..., : r // 2].reshape(-1, 1, r // 2)
+                o1 = x1 * c - x2 * s2
+                o2 = x1 * s2 + x2 * c
+                return torch.cat(
+                    [o1, o2, x[..., r:]], dim=-1
+                ).to(x.dtype)
+
+            q = _rope(q, position_cos, position_sin)
+            k = _rope(k, position_cos, position_sin)
+            return (
+                q.reshape(qkv.shape[0], -1),
+                k.reshape(qkv.shape[0], -1),
+                v.reshape(qkv.shape[0], -1),
+                gate,
+            )
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
             position_sin,
