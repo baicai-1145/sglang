@@ -419,6 +419,43 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    if capture_decode_cuda_graph and current_platform.capabilities.graph_capture:
+        # Capture warmup ran REAL decode forwards on the static buffers:
+        # req_to_token rows, the mamba state pools and KV rows referenced by
+        # the initial (zero) index buffers got scribbled with fake data. A
+        # later real request that lands on those slots reads garbage from
+        # step 1 (observed: graph-vs-eager first-token divergence 12/12).
+        # Reset all pools to the pristine zeroed state the allocator expects.
+        try:
+            import torch
+
+            req_to_token = model_runner.req_to_token_pool.req_to_token
+            req_to_token.zero_()
+            kv_pool = model_runner.token_to_kv_pool
+            for aid in range(len(getattr(kv_pool, "layer_k_buffer", []) or []) or 1):
+                try:
+                    kv_pool.get_key_buffer(aid).zero_()
+                    kv_pool.get_value_buffer(aid).zero_()
+                except Exception:
+                    break
+            mamba_cache = getattr(model_runner, "mamba_cache", None)
+            if mamba_cache is not None:
+                for attr in ("conv_states", "ssm_states", "temporal_cache"):
+                    t = getattr(mamba_cache, attr, None)
+                    if isinstance(t, torch.Tensor):
+                        t.zero_()
+            if hasattr(model_runner.token_to_kv_pool, "mamba"):
+                mb = model_runner.token_to_kv_pool.mamba
+                for attr in ("conv_states", "ssm_states", "temporal_cache"):
+                    t = getattr(mb, attr, None)
+                    if isinstance(t, torch.Tensor):
+                        t.zero_()
+            logger.info(
+                "Post-capture pool reset done (req_to_token + KV + mamba zeroed)"
+            )
+        except Exception:
+            logger.warning("Post-capture pool reset failed", exc_info=True)
+
     if finalize:
         finalize_cuda_graph_capture(model_runner)
 

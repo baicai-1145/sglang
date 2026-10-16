@@ -123,16 +123,22 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with (
-            skip_guard_context,
-            graph_ctx(
-                graph,
-                pool=self._pool,
-                stream=self._capture_stream,
-                auto_dispatch_capture=True,
-            ),
-        ):
-            out = forward_fn()
+        import os as _os_capture_flag
+
+        _os_capture_flag.environ["DRAMA3_IN_CAPTURE"] = "1"
+        try:
+            with (
+                skip_guard_context,
+                graph_ctx(
+                    graph,
+                    pool=self._pool,
+                    stream=self._capture_stream,
+                    auto_dispatch_capture=True,
+                ),
+            ):
+                out = forward_fn()
+        finally:
+            _os_capture_flag.environ.pop("DRAMA3_IN_CAPTURE", None)
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

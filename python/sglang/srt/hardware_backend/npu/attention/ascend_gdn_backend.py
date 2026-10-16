@@ -173,7 +173,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             cs = conv_states[cache_indices]
             bad = int((~torch.isfinite(cs)).sum())
             if bad:
@@ -202,7 +202,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             w = self._get_conv_weights_t(layer).to(torch.float32)  # [k, dim]
             k = w.shape[0]
             import os as _odc
-            if _odc.environ.get("DRAMA3_DUMP_CONVDEC") and int(layer.layer_id) == 0:
+            if _odc.environ.get("DRAMA3_DUMP_CONVDEC") and not _odc.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
                 _st = int(getattr(self, "_convdec_dump_step", 0))
                 if _st < 40:
                     import torch as _td
@@ -303,7 +303,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DUMP_GDNSTEP") and int(layer.layer_id) == 0:
+        if _os.environ.get("DRAMA3_DUMP_GDNSTEP") and not _os.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
             # GDN decode 数值取证: 首个 GDN 层 (L0), 前 40 步, dump kernel 全输入+输出+状态
             _st = int(getattr(self, "_gdn_dump_step", 0))
             if _st < 40:
@@ -325,7 +325,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     print(f"[gdn-dump] L0 step0 saved q{tuple(query.shape)} k{tuple(key.shape)} v{tuple(value.shape)} a{tuple(a.shape)}", flush=True)
                 self._gdn_dump_step = _st + 1
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] decode L{layer.layer_id}: q_nan={bool(query.isnan().any())} "
                 f"v_nan={bool(value.isnan().any())} a_nan={bool(a.isnan().any())} "
@@ -457,7 +457,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     conv_states,
                 )
             import os as _ocv
-            if _ocv.environ.get("DRAMA3_DUMP_CONV"):
+            if _ocv.environ.get("DRAMA3_DUMP_CONV") and not _ocv.environ.get("DRAMA3_IN_CAPTURE"):
                 _ci = mixed_qkv[0].float()
                 print(f"[conv] L{layer.layer_id} prefill IN  norm={float(_ci.norm()):.2f} absmax={float(_ci.abs().max()):.3f} shape={tuple(mixed_qkv.shape)}", flush=True)
             if not _prefill_torch:
@@ -474,7 +474,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     run_mode=0,
                 )
             import os as _ocv2
-            if _ocv2.environ.get("DRAMA3_DUMP_CONV"):
+            if _ocv2.environ.get("DRAMA3_DUMP_CONV") and not _ocv2.environ.get("DRAMA3_IN_CAPTURE"):
                 _co = mixed_qkv[0].float()
                 _ci2 = _conv_input_snapshot[0].float() if _conv_input_snapshot is not None else _co
                 _rel = float((_co - _ci2).norm() / _ci2.norm().clamp(min=1e-9))
@@ -575,7 +575,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             import os as _os
 
-            if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+            if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
                 w = self._get_conv_weights_t(layer)
                 print(
                     f"[drama3] gdn gating: g_nan={bool(g.isnan().any())} "
@@ -633,7 +633,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] gdn extend out: nan={bool(core_attn_out.isnan().any())} "
                 f"absmax={float(core_attn_out.abs().max()):.3f} "
@@ -755,7 +755,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] chunk_gdn: q_max={float(qf.abs().max()):.3f} "
                 f"k_max={float(kf.abs().max()):.3f} v_max={float(vf.abs().max()):.3f} "

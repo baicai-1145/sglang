@@ -1069,7 +1069,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES"):
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] L{getattr(self, 'layer_id', '?')} in_proj: "
                 f"qkvz_nan={bool(projected_states_qkvz.isnan().any())} "
@@ -1241,7 +1241,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # Fully Connected
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
             hidden_states, tuple
         ):
             print(
@@ -1262,7 +1262,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
             hidden_states, tuple
         ):
             _r0 = hidden_states[0].float()
@@ -1669,7 +1669,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Fully Connected
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
             hidden_states, tuple
         ):
             print(
@@ -1693,7 +1693,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
+        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
             hidden_states, tuple
         ):
             print(
