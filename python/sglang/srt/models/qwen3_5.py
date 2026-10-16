@@ -1652,14 +1652,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # logit divergence vs eager). Build cos/sin IN-GRAPH with a dynamic
         # index_select on the fixed cos_sin_cache (capture-safe, verified).
         cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions)
-        last_dim = cos_sin.size(-1)
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2)
-            .repeat(1, 1, 2)
-            .chunk(2, dim=-2)
-        )
-        position_sin = sin.reshape(-1, 1, 1, last_dim)
-        position_cos = cos.reshape(-1, 1, 1, last_dim)
+        # cos_sin_cache row = [cos(F) | sin(F)] where F = #inv-freqs actually
+        # cached (may differ from kernel rope_dim). Build per-dim [N,1,1,2F]
+        # tables by repeating each half (NeoX per-dim layout).
+        half = cos_sin.size(-1) // 2
+        cos_h = cos_sin[..., :half]
+        sin_h = cos_sin[..., half:]
+        position_cos = cos_h.repeat(1, 2).reshape(-1, 1, 1, half * 2)
+        position_sin = sin_h.repeat(1, 2).reshape(-1, 1, 1, half * 2)
 
         import os as _osq
 
@@ -1673,16 +1673,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             qkv_f = qkv.reshape(qkv.shape[0], -1)
             _hq = self.q_size // self.head_dim
             _hk = self.num_kv_heads
-            q = qkv_f[:, : self.q_size].reshape(-1, _hq, self.head_dim)
+            # 布局 (kernel 源码实证): q 与 gate 交错 [hq, head_dim*2] 里
+            # 前 half=q 后 half=gate; 之后 k, v 各连续 kv_size/2.
+            qg = qkv_f[:, : self.q_size * 2].reshape(-1, _hq, self.head_dim * 2)
+            q = qg[..., : self.head_dim]
+            gate = qg[..., self.head_dim :]
             k = qkv_f[
-                :, self.q_size : self.q_size + self.kv_size // 2
+                :, self.q_size * 2 : self.q_size * 2 + self.kv_size
             ].reshape(-1, _hk, self.head_dim)
             v = qkv_f[
-                :, self.q_size + self.kv_size // 2 :
+                :, self.q_size * 2 + self.kv_size :
             ].reshape(-1, _hk, self.head_dim)
-            gate = qkv_f[
-                :, self.q_size + self.kv_size : self.q_size + self.kv_size + self.q_size
-            ].reshape(-1, _hq, self.head_dim)
 
             def _gemma_rms(x, w, eps):
                 xf = x.float()
@@ -1695,16 +1696,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             k = _gemma_rms(k, self.k_norm.weight, eps)
 
             def _rope(x, cos, sin):
+                # kernel 实证: NeoX 式, sin/cos 为 [N, rope_dim] 平铺
+                # (cos 前 half 与后 half 相同 — repeat 后的 per-dim 表)
                 d = x.shape[-1]
                 r = rope_dim if rope_dim < d else d
                 x1, x2 = x[..., : r // 2], x[..., r // 2 : r]
-                c = cos[..., : r // 2].reshape(-1, 1, r // 2)
-                s2 = sin[..., : r // 2].reshape(-1, 1, r // 2)
-                o1 = x1 * c - x2 * s2
-                o2 = x1 * s2 + x2 * c
-                return torch.cat(
-                    [o1, o2, x[..., r:]], dim=-1
-                ).to(x.dtype)
+                c = cos.reshape(x.shape[0], 1, r)
+                s2 = sin.reshape(x.shape[0], 1, r)
+                c1 = c[..., : r // 2]
+                s1 = s2[..., : r // 2]
+                o1 = x1 * c1 - x2 * s1
+                o2 = x1 * s1 + x2 * c1
+                return torch.cat([o1, o2, x[..., r:]], dim=-1).to(x.dtype)
 
             q = _rope(q, position_cos, position_sin)
             k = _rope(k, position_cos, position_sin)
