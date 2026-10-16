@@ -2762,23 +2762,12 @@ class AscendAttnBackend(AttentionBackend):
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1, Hv, layer.v_head_dim
         )
-        # ROOT-CAUSE FIX 2 (advanced-indexing gather on tensor tables also
-        # corrupts under NPUGraph replay — same family as embedding_bag and
-        # req_to_token.gather): flatten + index_select + reshape instead of
-        # k_cache[tokens] / v_cache[tokens].
-        _tk = tokens.reshape(-1)  # [bs*MAX_KV]
-        K = (
-            k_cache.reshape(k_cache.shape[0], -1)
-            .index_select(0, _tk)
-            .reshape(bs, MAX_KV, Hk, D)
-            .transpose(1, 2)
-        )  # [bs, Hk, MAX_KV, D]
-        V = (
-            v_cache.reshape(v_cache.shape[0], -1)
-            .index_select(0, _tk)
-            .reshape(bs, MAX_KV, Hv, Dv)
-            .transpose(1, 2)
-        )  # [bs, Hv, MAX_KV, Dv]
+        # REVERT of the flatten+index_select attempt: with the tokens one-hot
+        # construction above, the U8-era advanced indexing was the best-
+        # verified configuration (short-text 6.2% CER). The giant one_hot
+        # [bs, MAX_KV, tbl_w] is itself suspect under replay; tokens is int64.
+        K = k_cache[tokens].transpose(1, 2)  # [bs, Hk, MAX_KV, D]
+        V = v_cache[tokens].transpose(1, 2)  # [bs, Hv, MAX_KV, Dv]
         Q = (
             q.reshape(bs, Hq, D)
             .unsqueeze(2)
