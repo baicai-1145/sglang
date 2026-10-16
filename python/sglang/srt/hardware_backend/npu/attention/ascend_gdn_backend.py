@@ -663,23 +663,52 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 device=qf.device,
             )
 
+        import os as _ogt
+        _torch_gdn = bool(_ogt.environ.get("DRAMA3_GDN_PREFILL_TORCH"))
         asl = torch.ones(1, dtype=torch.int32, device=qf.device)
         outs = []
-        for b, (s, e) in enumerate(seq_bounds):
-            idx = torch.tensor([b], dtype=torch.int32, device=qf.device)
-            for t in range(s, e):
-                o = torch.ops.npu.npu_recurrent_gated_delta_rule(
-                    qf[t : t + 1].contiguous(),
-                    kf[t : t + 1].contiguous(),
-                    vf[t : t + 1].contiguous(),
-                    state,
-                    beta=betaf[t : t + 1].contiguous(),
-                    scale=scale,
-                    actual_seq_lengths=asl,
-                    ssm_state_indices=idx,
-                    g=gf[t : t + 1].contiguous(),
-                )
-                outs.append(o)
+        if _torch_gdn:
+            # aclnnRecurrentGatedDeltaRule standalone 对拍 relerr 80.8% /
+            # 终态 100% (exp_s, 10-16 00:32) — 算子本身数值坏. 纯 torch 递推
+            # (与 decode kernel 同公式: v_d = β·v − (h·e^g)·k; h += k⊗v_d;
+            #  o = h·q·scale; 状态 [Nv, Dk, Dv] k行v列, fp32 累积).
+            Nv_, Dk_, Dv_ = vf.shape[-2], kf.shape[-1], vf.shape[-1]
+            for b, (s, e) in enumerate(seq_bounds):
+                # decode pool 布局 [Nv, K, V] (k行v列, exp_p 已证); aclnn doc
+                # 布局是 [Nv, Dv, Dk] — 交叉转置对齐 pool 惯例后演化.
+                h = state[b].to(torch.float32).transpose(1, 2).contiguous()  # [Nv, K, V]
+                for t in range(s, e):
+                    qt = qf[t].to(torch.float32) * scale
+                    kt = kf[t].to(torch.float32)
+                    vt = vf[t].to(torch.float32)
+                    bt = betaf[t].to(torch.float32)
+                    gt = gf[t].to(torch.float32)
+                    rep = Nv_ // qt.shape[-2]
+                    kt_hv = kt.repeat_interleave(rep, dim=-2) if kt.shape[-2] != Nv_ else kt
+                    qt_hv = qt.repeat_interleave(rep, dim=-2) if qt.shape[-2] != Nv_ else qt
+                    h = h * torch.exp(gt)[:, None, None]
+                    Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
+                    v_d = bt[:, None] * vt - Sk
+                    h = h + torch.einsum('hk,hv->hkv', kt_hv, v_d)
+                    o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
+                    outs.append(o_t.to(v.dtype).unsqueeze(0))
+                state[b] = h.to(state.dtype)
+        else:
+            for b, (s, e) in enumerate(seq_bounds):
+                idx = torch.tensor([b], dtype=torch.int32, device=qf.device)
+                for t in range(s, e):
+                    o = torch.ops.npu.npu_recurrent_gated_delta_rule(
+                        qf[t : t + 1].contiguous(),
+                        kf[t : t + 1].contiguous(),
+                        vf[t : t + 1].contiguous(),
+                        state,
+                        beta=betaf[t : t + 1].contiguous(),
+                        scale=scale,
+                        actual_seq_lengths=asl,
+                        ssm_state_indices=idx,
+                        g=gf[t : t + 1].contiguous(),
+                    )
+                    outs.append(o)
 
         import os as _os
 

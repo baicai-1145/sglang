@@ -1678,6 +1678,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 f"absmax={float(hidden_states.abs().max()):.3f}",
                 flush=True,
             )
+        import os as _osr2
+        if _osr2.environ.get("DRAMA3_DUMP_RESID") and not isinstance(hidden_states, tuple) and hidden_states.shape[0] > 0:
+            _r1 = hidden_states[0].float()
+            print(f"[resid] L{self.layer_id}-attn POSTATTN norm={float(_r1.norm()):.2f}", flush=True)
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
