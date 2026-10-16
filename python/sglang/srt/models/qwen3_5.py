@@ -908,6 +908,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        import os as _opj
+        if _opj.environ.get("DRAMA3_DUMP_PROJ"):
+            _q = projected_states_qkvz[0].float()
+            print(f"[proj] L{getattr(self, 'layer_id', '?')} qkvz_out norm={float(_q.norm()):.2f} "
+                  f"absmax={float(_q.abs().max()):.3f} w_norm={float(self.in_proj_qkvz.weight.float().norm()):.1f}",
+                  flush=True)
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
@@ -1222,6 +1228,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        import os as _ors
+        if _ors.environ.get("DRAMA3_DUMP_RESID") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+            _h0 = hs[0].float()
+            print(f"[resid] L{getattr(self, 'layer_id', '?')}-lin IN  norm={float(_h0.norm()):.2f} absmax={float(_h0.abs().max()):.3f}", flush=True)
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
@@ -1255,6 +1265,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not isinstance(
             hidden_states, tuple
         ):
+            _r0 = hidden_states[0].float()
+            print(f"[resid] L{getattr(self, 'layer_id', '?')}-lin OUT norm={float(_r0.norm()):.2f}", flush=True)
             print(
                 f"[drama3] L{getattr(self, 'layer_id', '?')}-lin post-mlp "
                 f"nan={bool(hidden_states.isnan().any())} "
@@ -1643,6 +1655,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        import os as _orsa
+        if _orsa.environ.get("DRAMA3_DUMP_RESID") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+            _h0 = hs[0].float()
+            print(f"[resid] L{self.layer_id}-attn IN  norm={float(_h0.norm()):.2f} absmax={float(_h0.abs().max()):.3f}", flush=True)
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,

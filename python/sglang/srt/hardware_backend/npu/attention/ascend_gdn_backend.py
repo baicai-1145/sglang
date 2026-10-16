@@ -399,18 +399,42 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 if _os.environ.get("DRAMA3_CONV_PREFILL_SAFE")
                 else None
             )
-            mixed_qkv = torch.ops.npu.causal_conv1d(
-                mixed_qkv,
-                self._get_conv_weights_t(layer),
-                conv_states=conv_states_for_prefill,
-                bias=layer.bias,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
-                has_initial_state=has_initial_states,
-                activation_mode=1,
-                pad_slot_id=-1,
-                run_mode=0,
-            )
+            import os as _oct
+            _prefill_torch = bool(_oct.environ.get("DRAMA3_CONV_PREFILL_TORCH"))
+            if _prefill_torch:
+                # aclnn causal_conv1d (run_mode=0) 数值崩坏取证: L0 IN 232.8 -> OUT 0.00,
+                # L5 459->1.64, L6 440->1363 (10-15 00:03). 精确 torch 替代, 不等 NaN.
+                mixed_qkv = self._torch_conv1d_prefill(
+                    layer,
+                    mixed_qkv,
+                    query_start_loc,
+                    cache_indices,
+                    has_initial_states,
+                    conv_states,
+                )
+            import os as _ocv
+            if _ocv.environ.get("DRAMA3_DUMP_CONV"):
+                _ci = mixed_qkv[0].float()
+                print(f"[conv] L{layer.layer_id} prefill IN  norm={float(_ci.norm()):.2f} absmax={float(_ci.abs().max()):.3f} shape={tuple(mixed_qkv.shape)}", flush=True)
+            if not _prefill_torch:
+                mixed_qkv = torch.ops.npu.causal_conv1d(
+                    mixed_qkv,
+                    self._get_conv_weights_t(layer),
+                    conv_states=conv_states_for_prefill,
+                    bias=layer.bias,
+                    query_start_loc=query_start_loc,
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_states,
+                    activation_mode=1,
+                    pad_slot_id=-1,
+                    run_mode=0,
+                )
+            import os as _ocv2
+            if _ocv2.environ.get("DRAMA3_DUMP_CONV"):
+                _co = mixed_qkv[0].float()
+                _ci2 = _conv_input_snapshot[0].float() if _conv_input_snapshot is not None else _co
+                _rel = float((_co - _ci2).norm() / _ci2.norm().clamp(min=1e-9))
+                print(f"[conv] L{layer.layer_id} prefill OUT norm={float(_co.norm()):.2f} absmax={float(_co.abs().max()):.3f} rel_change={_rel:.4f} path={'torch' if _prefill_torch else 'aclnn'}", flush=True)
             if _conv_input_snapshot is not None:
                 # The aclnn FN path (run_mode=0) intermittently emits NaN on
                 # multi-request batches even with finite inputs/states. The
@@ -520,9 +544,37 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     flush=True,
                 )
 
+            import os as _ogd
+            _dump_gdn_ext = _ogd.environ.get("DRAMA3_DUMP_GDNEXT")
+            if _dump_gdn_ext:
+                print(f"[gdn-ext] L{layer.layer_id} prefill: q_norm={float(query.float().norm()):.2f} "
+                      f"k_norm={float(key.float().norm()):.2f} v_norm={float(value.float().norm()):.2f} "
+                      f"g_absmax={float(g.abs().max()):.2f} out_pre_norm=-", flush=True)
+            _first_dump = _dump_gdn_ext and not getattr(self, "_gdnext_saved", False)
+            if _first_dump:
+                self._gdnext_saved = True
+                import torch as _tg
+                _tg.save({
+                    "q": query.detach().float().cpu(),
+                    "k": key.detach().float().cpu(),
+                    "v": value.detach().float().cpu(),
+                    "g": g.detach().float().cpu(),
+                    "beta": beta.detach().float().cpu(),
+                    "state_init": ssm_states[cache_indices].detach().float().cpu(),
+                    "qsl": query_start_loc.detach().cpu(),
+                }, "/workspace/drama3-work/.tmp/gdnext_in.pt")
+                print(f"[gdn-ext] FIRST GDN layer {layer.layer_id} dumped q{tuple(query.shape)} g{tuple(g.shape)} beta{tuple(beta.shape)}", flush=True)
             core_attn_out, last_recurrent_state, h = self.chunk_gdn(
                 query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
             )
+            if _first_dump:
+                import torch as _tg2
+                _tg2.save({
+                    "out": core_attn_out.detach().float().cpu(),
+                    "state_final": (last_recurrent_state.detach().float().cpu()
+                                    if last_recurrent_state is not None else None),
+                }, "/workspace/drama3-work/.tmp/gdnext_out.pt")
+                print(f"[gdn-ext] out{tuple(core_attn_out.shape)} saved", flush=True)
 
             if last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
