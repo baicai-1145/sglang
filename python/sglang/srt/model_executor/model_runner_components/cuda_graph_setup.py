@@ -426,6 +426,15 @@ def capture_cuda_graphs(
         # later real request that lands on those slots reads garbage from
         # step 1 (observed: graph-vs-eager first-token divergence 12/12).
         # Reset all pools to the pristine zeroed state the allocator expects.
+        import os as _opc
+
+        if _opc.environ.get("DRAMA3_NO_POOL_RESET"):
+            logger.info("Post-capture pool reset SKIPPED (env)")
+            if finalize:
+                finalize_cuda_graph_capture(model_runner)
+            return CudaGraphsCapture(
+                eager_runner=eager_runner, prefill=prefill, decode=decode
+            )
         try:
             import torch
 
@@ -438,18 +447,33 @@ def capture_cuda_graphs(
                     kv_pool.get_value_buffer(aid).zero_()
                 except Exception:
                     break
-            mamba_cache = getattr(model_runner, "mamba_cache", None)
-            if mamba_cache is not None:
-                for attr in ("conv_states", "ssm_states", "temporal_cache"):
-                    t = getattr(mamba_cache, attr, None)
-                    if isinstance(t, torch.Tensor):
-                        t.zero_()
-            if hasattr(model_runner.token_to_kv_pool, "mamba"):
-                mb = model_runner.token_to_kv_pool.mamba
-                for attr in ("conv_states", "ssm_states", "temporal_cache"):
-                    t = getattr(mb, attr, None)
-                    if isinstance(t, torch.Tensor):
-                        t.zero_()
+            # Mamba/GDN pools: the runtime tensors are reached via
+            # req_to_token_pool.mamba2_layer_cache(layer_id) -> .conv[0] /
+            # .temporal (the exact objects the GDN decode path reads).
+            req_pool = model_runner.req_to_token_pool
+            m2 = getattr(req_pool, "mamba2_layer_cache", None)
+            if callable(m2):
+                zeroed = 0
+                lid = 0
+                while True:
+                    try:
+                        lc = m2(lid)
+                    except Exception:
+                        break
+                    if lc is None:
+                        break
+                    ts = [getattr(lc, "temporal", None)] + list(
+                        getattr(lc, "conv", None) or []
+                    )
+                    for t in ts:
+                        if isinstance(t, torch.Tensor) and t.numel():
+                            t.zero_()
+                            zeroed += 1
+                    lid += 1
+                logger.info(
+                    f"Post-capture reset zeroed {zeroed} mamba tensors "
+                    f"across {lid} layers"
+                )
             logger.info(
                 "Post-capture pool reset done (req_to_token + KV + mamba zeroed)"
             )

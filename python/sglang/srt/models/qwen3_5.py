@@ -356,6 +356,37 @@ if _is_npu:
     )
 
 
+
+
+def _trace_layer_out(module, out, kind):
+    """Capture-safe per-layer output norm recorder (graph forensics).
+
+    Writes norms into a persistent per-module buffer with pure device ops —
+    no host sync, safe under NPUGraph capture and replay. Read out-of-graph
+    via DRAMA3_LAYERTRACE.
+    """
+    import os as _otl
+
+    if not _otl.environ.get("DRAMA3_LAYERTRACE"):
+        return
+    tl = getattr(module, "_lt_buf", None)
+    if tl is None:
+        import torch as _ttl
+
+        tl = module._lt_buf = _ttl.zeros(
+            128, 3, dtype=_ttl.float32, device=out.device
+        )
+        module._lt_idx = 0
+    import torch as _tt
+
+    i = module._lt_idx
+    if i < 128:
+        tl[i, 0] = out.detach().float().norm()
+        tl[i, 1] = out.detach().float().abs().max()
+        tl[i, 2] = i
+    module._lt_idx = i + 1
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -1132,6 +1163,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         output, _ = self.out_proj(core_attn_out)
+        _trace_layer_out(self, output, "gdn")
         return output
 
 
@@ -1560,14 +1592,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
-            self.rotary_emb.get_cos_sin_with_position(positions)
+        # GRAPH FIX (950PR): the old path refreshed rotary_emb.position_cos/
+        # position_sin ONLY at the first full-attn layer via an eager Python
+        # call; under NPU graph capture that branch is frozen, so every replay
+        # reused the capture-time positions' cos/sin — all full-attention
+        # layers decoded with wrong rotary embedding from step 1 (first-token
+        # logit divergence vs eager). Build cos/sin IN-GRAPH with a dynamic
+        # index_select on the fixed cos_sin_cache (capture-safe, verified).
+        cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions)
+        last_dim = cos_sin.size(-1)
+        cos, sin = (
+            cos_sin.reshape(-1, 2, last_dim // 2)
+            .repeat(1, 1, 2)
+            .chunk(2, dim=-2)
+        )
+        position_sin = sin.reshape(-1, 1, 1, last_dim)
+        position_cos = cos.reshape(-1, 1, 1, last_dim)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
-            self.rotary_emb.position_sin,
-            self.rotary_emb.position_cos,
+            position_sin,
+            position_cos,
             self.q_size,
             self.kv_size,
             self.head_dim,
@@ -1637,6 +1682,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = attn_output * torch.sigmoid(gate_val)
 
         output, _ = self.o_proj(attn_output)
+        _trace_layer_out(self, output, "attn")
         return output
 
     def forward(
