@@ -806,6 +806,55 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
 
+        import os as _ofr
+
+        if _ofr.environ.get("DRAMA3_GDN_DECODE_TORCH"):
+            # ROOT-CAUSE FIX: aclnnRecurrentGatedDeltaRule is NOT faithful
+            # under NPUGraph replay (standalone repro: same-input out relerr
+            # 199x, in-place state drift 2.6e5). Pure-torch recurrence,
+            # capture-safe, exact eager math.
+            import torch as _tfr
+
+            _q, _k, _v = (
+                mix_qkv[..., : num_heads * head_k_dim],
+                mix_qkv[
+                    ...,
+                    num_heads * head_k_dim : num_heads * head_k_dim
+                    + num_heads * head_k_dim,
+                ],
+                mix_qkv[
+                    ...,
+                    2 * num_heads * head_k_dim : 2 * num_heads * head_k_dim
+                    + num_value_heads * head_v_dim,
+                ],
+            )
+            _rep = num_value_heads // num_heads
+            _sc = head_k_dim**-0.5
+
+            def _l2n(x):
+                return x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+            _qt = _l2n(_q.float()) * _sc
+            _kt = _l2n(_k.float())
+            _kt_hv = _kt.repeat_interleave(_rep, dim=-2)
+            _qt_hv = _qt.repeat_interleave(_rep, dim=-2)
+            # g arrives as the precomputed log-decay from
+            # fused_gdn_gating(A_log, a, b, dt_bias) — use as-is (fp32)
+            _gd = g.float()
+            _beta = torch.sigmoid(beta.float())
+            h = recurrent_state[cache_indices.to(torch.int64)].float()
+            h = h * torch.exp(_gd).reshape(batch_size, -1, 1, 1)
+            Sk = torch.einsum("bhkv,bhk->bhv", h, _kt_hv)
+            u = _beta.reshape(batch_size, -1, 1) * _v.float() - Sk
+            h = h + torch.einsum("bhk,bhv->bhkv", _kt_hv, u)
+            recurrent_state[cache_indices.to(torch.int64)] = h.to(
+                recurrent_state.dtype
+            )
+            o = torch.einsum("bhkv,bhk->bhv", h, _qt_hv)
+            return o.to(mix_qkv.dtype).reshape(
+                batch_size, seq_len, num_value_heads * head_v_dim
+            )
+
         attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
             mix_qkv,
             recurrent_state,

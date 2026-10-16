@@ -387,6 +387,154 @@ def _trace_layer_out(module, out, kind):
     module._lt_idx = i + 1
 
 
+def _mk_ts_buf(device, rows=64):
+    import torch as _tt
+
+    return (
+        _tt.zeros(rows, dtype=_tt.float32, device=device),
+        _tt.zeros(1, dtype=_tt.int32, device=device),
+    )
+
+
+def _ts_write(buf, ptr, tensor, w8, rows=64):
+    import torch as _tq
+
+    f = tensor.detach().reshape(tensor.shape[0], -1)[0, :8].float()
+    idx = ptr.clamp(max=rows - 1)
+    buf.index_put_(
+        (idx.to(_tq.int64),),
+        (f * w8).sum().reshape(1),
+    )
+    ptr.add_(1)
+
+
+def _trace_sub_qkv(module_self, q, k, v):
+    """Capture-safe q/k/v fingerprint (shared in-place buffer per module)."""
+    import os as _te
+
+    if not _te.environ.get("DRAMA3_LAYERTRACE"):
+        return
+    w8 = getattr(module_self, "_qkv_w8", None)
+    if w8 is None or q.device != w8.device:
+        import torch as _tw
+
+        w8 = module_self._qkv_w8 = _tw.tensor(
+            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+            device=q.device,
+            dtype=_tw.float32,
+        )
+        b, p = _mk_ts_buf(q.device)
+        module_self._qkv_buf = b
+        module_self._qkv_ptr = p
+    _ts_write(module_self._qkv_buf, module_self._qkv_ptr, q, w8)
+    _ts_write(module_self._qkv_buf, module_self._qkv_ptr, k, w8)
+    _ts_write(module_self._qkv_buf, module_self._qkv_ptr, v, w8)
+
+
+def _trace_sub_attnout(module_self, attn_output):
+    """Capture-safe attention-core output fingerprint."""
+    import os as _te
+
+    if not _te.environ.get("DRAMA3_LAYERTRACE"):
+        return
+    w8 = getattr(module_self, "_ao_w8", None)
+    if w8 is None or attn_output.device != w8.device:
+        import torch as _tw
+
+        w8 = module_self._ao_w8 = _tw.tensor(
+            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+            device=attn_output.device,
+            dtype=_tw.float32,
+        )
+        b, p = _mk_ts_buf(attn_output.device)
+        module_self._ao_buf = b
+        module_self._ao_ptr = p
+    _ts_write(module_self._ao_buf, module_self._ao_ptr, attn_output, w8)
+
+
+def _trace_sub(module, tensor, kind):
+    """Capture-safe sub-module recorder with DEVICE-side write pointer.
+
+    The slot index lives on-device so graph replay advances it without host
+    Python: each call writes at ptr and does ptr += 1 (clamped to rows-1 so
+    the buffer keeps the LAST value for out-of-graph reads).
+    """
+    import os as _ts
+
+    if not _ts.environ.get("DRAMA3_LAYERTRACE"):
+        return
+    ROWS = 64
+    tb = getattr(module, "_ts_buf", None)
+    if tb is None:
+        import torch as _tt
+
+        tb = module._ts_buf = _tt.zeros(ROWS, 2, dtype=_tt.float32, device=tensor.device)
+        module._ts_ptr = _tt.zeros(1, dtype=_tt.int32, device=tensor.device)
+    f = tensor.detach().reshape(tensor.shape[0], -1)[0, :8].float()
+    w = getattr(module, "_ts_w8", None)
+    if w is None:
+        import torch as _tw
+
+        w = module._ts_w8 = _tw.tensor(
+            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+            device=tensor.device,
+            dtype=_tw.float32,
+        )
+    import torch as _tq
+
+    idx = module._ts_ptr.clamp(max=ROWS - 1)  # [1] int32, shared storage
+    tb = module._ts_buf
+    tb.index_put_(
+        (idx.to(_tq.int64), _tq.zeros(1, dtype=_tq.int64, device=tb.device)),
+        (f * w).sum().reshape(1),
+    )
+    tb.index_put_(
+        (idx.to(_tq.int64), _tq.ones(1, dtype=_tq.int64, device=tb.device)),
+        tensor.detach().float().norm().reshape(1),
+    )
+    module._ts_ptr.add_(1)  # in-place: replay advances the shared pointer
+
+
+def torch_npu_capturing() -> bool:
+    try:
+        import torch_npu
+
+        return bool(torch_npu.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _trace_layer_in(module, inp):
+    """Capture-safe per-layer INPUT norm recorder (first forward input)."""
+    import os as _oti
+
+    if not _oti.environ.get("DRAMA3_LAYERTRACE"):
+        return
+    tb = getattr(module, "_li_buf", None)
+    if tb is None:
+        import torch as _tti
+
+        tb = module._li_buf = _tti.zeros(128, 2, dtype=_tti.float32, device=inp.device)
+        module._li_idx = 0
+    j = module._li_idx
+    if j < 128:
+        tb[j, 0] = inp.detach().float().norm()
+        tb[j, 1] = inp.detach().float().abs().max()
+        # fingerprint: 首行前4元素与末4元素 (方向敏感, capture-safe device op)
+        w8 = getattr(module, "_li_w8", None)
+        if w8 is None:
+            import torch as _tw
+
+            w8 = module._li_w8 = _tw.tensor(
+                [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                device=inp.device,
+                dtype=torch.float32,
+            )
+        f8 = inp.detach().reshape(inp.shape[0], -1)[0, :8].float()
+        tb[j, 0] = tb[j, 0] * 0 + (f8 * w8).sum()
+    module._li_idx = j + 1
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -1050,6 +1198,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        _trace_layer_in(self, hidden_states)
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -1313,7 +1462,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         import os as _ors
-        if _ors.environ.get("DRAMA3_DUMP_RESID") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        if _ors.environ.get("DRAMA3_DUMP_RESID") and not _ors.environ.get("DRAMA3_IN_CAPTURE") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             _h0 = hs[0].float()
             print(f"[resid] L{getattr(self, 'layer_id', '?')}-lin IN  norm={float(_h0.norm()):.2f} absmax={float(_h0.abs().max()):.3f}", flush=True)
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
@@ -1327,7 +1476,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
             hidden_states, tuple
-        ):
+        ):  # guarded
             print(
                 f"[drama3] L{getattr(self, 'layer_id', '?')}-lin post-attn "
                 f"nan={bool(hidden_states.isnan().any())} "
@@ -1357,6 +1506,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 f"absmax={float(hidden_states.abs().max()):.3f}",
                 flush=True,
             )
+        _trace_sub(self, hidden_states, "submlp")
         return ffn_exit.finish(hidden_states)
 
 
@@ -1769,13 +1919,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        _trace_layer_in(self, hidden_states)
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        _trace_sub_qkv(self, q, k, v)
 
         attn_output = self.attn(q, k, v, forward_batch)
+        _trace_sub_attnout(self, attn_output)
 
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
@@ -1791,6 +1944,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         _trace_layer_out(self, output, "attn")
+        _trace_sub(self, attn_output, "subattn")
         return output
 
     def forward(
@@ -1810,7 +1964,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         import os as _orsa
-        if _orsa.environ.get("DRAMA3_DUMP_RESID") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        if _orsa.environ.get("DRAMA3_DUMP_RESID") and not _orsa.environ.get("DRAMA3_IN_CAPTURE") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             _h0 = hs[0].float()
             print(f"[resid] L{self.layer_id}-attn IN  norm={float(_h0.norm()):.2f} absmax={float(_h0.abs().max()):.3f}", flush=True)
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
@@ -1825,7 +1979,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
             hidden_states, tuple
-        ):
+        ):  # guarded
             print(
                 f"[drama3] L{self.layer_id}-attn post-attn "
                 f"nan={bool(hidden_states.isnan().any())} "
@@ -1833,9 +1987,25 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 flush=True,
             )
         import os as _osr2
-        if _osr2.environ.get("DRAMA3_DUMP_RESID") and not isinstance(hidden_states, tuple) and hidden_states.shape[0] > 0:
+        if _osr2.environ.get("DRAMA3_DUMP_RESID") and not _osr2.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(hidden_states, tuple) and hidden_states.shape[0] > 0:
             _r1 = hidden_states[0].float()
-            print(f"[resid] L{self.layer_id}-attn POSTATTN norm={float(_r1.norm()):.2f}", flush=True)
+            _w = getattr(self, "_res_w8", None)
+            if _w is None or _w.device != _r1.device:
+                import torch as _tw2
+
+                _w = self._res_w8 = _tw2.tensor(
+                    [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                    device=_r1.device,
+                    dtype=torch.float32,
+                )
+            import os as _ofp
+
+            _fp = (
+                (_r1.reshape(-1)[:8] * _w).sum().item()
+                if (not torch_npu_capturing() and not _ofp.environ.get("DRAMA3_IN_CAPTURE"))
+                else float("nan")
+            )
+            print(f"[resid] L{self.layer_id}-attn POSTATTN norm={float(_r1.norm()):.2f} fp={_fp:.1f}", flush=True)
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
@@ -1856,6 +2026,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 f"absmax={float(hidden_states.abs().max()):.3f}",
                 flush=True,
             )
+        _trace_sub(self, hidden_states, "submlp")
         return ffn_exit.finish(hidden_states)
 
 

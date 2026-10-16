@@ -52,6 +52,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._forward_fns: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -142,6 +143,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        self._forward_fns[shape_key] = forward_fn
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs

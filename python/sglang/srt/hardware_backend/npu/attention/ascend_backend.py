@@ -2742,9 +2742,19 @@ class AscendAttnBackend(AttentionBackend):
         base = torch.where(
             row_valid.unsqueeze(1), base, torch.zeros_like(base)
         ).clamp(max=tbl_w - 1)
-        tokens = self.req_to_token_pool.req_to_token.gather(
-            1, (base + kv_idx).clamp(max=tbl_w - 1)
-        ).clamp(min=0)  # [bs, MAX_KV] token ids (clamped: padded rows masked)
+        # ROOT-CAUSE FIX (graph replay corruption): Tensor.gather on the int32
+        # req_to_token table returned ZEROS under NPUGraph replay even though
+        # req_pool_indices/seq_lens read correctly in the same replay (AT trace:
+        # tokens[0..2]=0,0,0 while eager gathers [1,2,3]). gather-on-int-table
+        # is the same op family as the embedding_bag failure. Replace with
+        # index_select (row select, verified capture-safe in the RoPE fix)
+        # plus a mask-selected per-position lookup built from arithmetic the
+        # graph cannot freeze: row[pos] = (row * onehot_pos).sum(-1).
+        _r2t = self.req_to_token_pool.req_to_token
+        _row = _r2t.index_select(0, base.reshape(-1).clamp(max=tbl_w - 1))  # [bs, tbl_w]
+        _pos = (base * 0 + kv_idx).clamp(max=tbl_w - 1)  # [bs, MAX_KV]
+        _onehot = torch.nn.functional.one_hot(_pos, tbl_w).to(_row.dtype)  # [bs,MAX_KV,tbl_w]
+        tokens = (_row.unsqueeze(1) * _onehot).sum(-1).clamp(min=0)  # [bs, MAX_KV]
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, Hk, D
@@ -2787,6 +2797,59 @@ class AscendAttnBackend(AttentionBackend):
         scores = scores.masked_fill(mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         out = torch.einsum("bhqk,bhkd->bhqd", probs, V)  # [bs, Hq, 1, Dv]
+        import os as _odg
+
+        if _odg.environ.get("DRAMA3_ATTN_TRACE"):
+            if not _odg.environ.get("DRAMA3_IN_CAPTURE"):
+                _sv = int(getattr(self, "_attn_dbg_calls", 0))
+                if _sv < 3:
+                    print(f"[attn-trace] sdpa path reached, layer={layer.layer_id}", flush=True)
+                self._attn_dbg_calls = _sv + 1
+            _dbg = getattr(self, "_attn_trace_buf", None)
+            if _dbg is None or _dbg.device != q.device:
+                import torch as _tg
+
+                _dbg = self._attn_trace_buf = _tg.zeros(
+                    32, 8, dtype=_tg.float32, device=q.device
+                )
+                self._attn_trace_ptr = _tg.zeros(
+                    1, dtype=_tg.int32, device=q.device
+                )
+            import torch as _tq2
+
+            _p = self._attn_trace_ptr.clamp(max=31)
+            w8 = getattr(self, "_attn_w8", None)
+            if w8 is None or w8.device != q.device:
+                import torch as _tw8
+
+                w8 = self._attn_w8 = _tw8.tensor(
+                    [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
+                    device=q.device,
+                    dtype=_tw8.float32,
+                )
+            _k0 = K[0, 0, 0, :8].float()
+            _v0 = V[0, 0, 0, :8].float()
+            _o0 = out.reshape(bs, -1)[0, :8].float()
+            _vals = torch.stack(
+                [
+                    (_k0 * w8).sum(),
+                    (_v0 * w8).sum(),
+                    (_o0 * w8).sum(),
+                    seq_lens[0].float(),
+                    forward_batch.req_pool_indices[0].float(),
+                    tokens[0, 0].float(),
+                    tokens[0, 1].float(),
+                    tokens[0, 2].float(),
+                ]
+            )  # [8]
+            _dbg.index_put_(
+                (
+                    _p.to(_tq2.int64),
+                    _tq2.arange(8, device=_dbg.device, dtype=_tq2.int64),
+                ),
+                _vals,
+            )
+            self._attn_trace_ptr.add_(1)
         return out.reshape(bs, Hq * Dv)
 
     def forward_decode_graph(

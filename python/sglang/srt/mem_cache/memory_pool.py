@@ -204,8 +204,20 @@ def _set_kv_buffer_impl(
         )
 
     from sglang.srt.model_executor.runner import get_is_capture_mode
+    import os as _okv
 
-    if get_is_capture_mode() and alt_stream is not None:
+    # ROOT-CAUSE FIX (graph replay corruption): the alt-stream K/V dual-write
+    # (k on the capture stream, v on a side stream fenced with wait_stream)
+    # serialises wrongly under NPUGraph replay — the replayed v write can land
+    # after the attention read, so full-attn layers decode with a stale/garbage
+    # V row (verified: decode0 q/k/v inputs bit-exact but attention output
+    # diverges; both aclnnFusedInferAttentionScore and torch-sdpa paths fail).
+    # Write K and V sequentially on one stream inside captured graphs.
+    if (
+        get_is_capture_mode()
+        and alt_stream is not None
+        and not _okv.environ.get("DRAMA3_KV_SINGLE_STREAM")
+    ):
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)
         k_cache[indices] = k
