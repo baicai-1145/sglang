@@ -2742,19 +2742,9 @@ class AscendAttnBackend(AttentionBackend):
         base = torch.where(
             row_valid.unsqueeze(1), base, torch.zeros_like(base)
         ).clamp(max=tbl_w - 1)
-        # ROOT-CAUSE FIX (graph replay corruption): Tensor.gather on the int32
-        # req_to_token table returned ZEROS under NPUGraph replay even though
-        # req_pool_indices/seq_lens read correctly in the same replay (AT trace:
-        # tokens[0..2]=0,0,0 while eager gathers [1,2,3]). gather-on-int-table
-        # is the same op family as the embedding_bag failure. Replace with
-        # index_select (row select, verified capture-safe in the RoPE fix)
-        # plus a mask-selected per-position lookup built from arithmetic the
-        # graph cannot freeze: row[pos] = (row * onehot_pos).sum(-1).
-        _r2t = self.req_to_token_pool.req_to_token
-        _row = _r2t.index_select(0, base.reshape(-1).clamp(max=tbl_w - 1))  # [bs, tbl_w]
-        _pos = (base * 0 + kv_idx).clamp(max=tbl_w - 1)  # [bs, MAX_KV]
-        _onehot = torch.nn.functional.one_hot(_pos, tbl_w).to(_row.dtype)  # [bs,MAX_KV,tbl_w]
-        tokens = (_row.unsqueeze(1) * _onehot).sum(-1).clamp(min=0)  # [bs, MAX_KV]
+        tokens = self.req_to_token_pool.req_to_token.gather(
+            1, (base + kv_idx).clamp(max=tbl_w - 1)
+        ).clamp(min=0)  # [bs, MAX_KV] token ids (clamped: padded rows masked)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, Hk, D
@@ -2762,10 +2752,6 @@ class AscendAttnBackend(AttentionBackend):
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1, Hv, layer.v_head_dim
         )
-        # REVERT of the flatten+index_select attempt: with the tokens one-hot
-        # construction above, the U8-era advanced indexing was the best-
-        # verified configuration (short-text 6.2% CER). The giant one_hot
-        # [bs, MAX_KV, tbl_w] is itself suspect under replay; tokens is int64.
         K = k_cache[tokens].transpose(1, 2)  # [bs, Hk, MAX_KV, D]
         V = v_cache[tokens].transpose(1, 2)  # [bs, Hv, MAX_KV, Dv]
         Q = (
@@ -2801,73 +2787,6 @@ class AscendAttnBackend(AttentionBackend):
         scores = scores.masked_fill(mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         out = torch.einsum("bhqk,bhkd->bhqd", probs, V)  # [bs, Hq, 1, Dv]
-        import os as _odg
-
-        if _odg.environ.get("DRAMA3_ATTN_TRACE"):
-            if not _odg.environ.get("DRAMA3_IN_CAPTURE"):
-                _sv = int(getattr(self, "_attn_dbg_calls", 0))
-                if _sv < 3:
-                    print(f"[attn-trace] sdpa path reached, layer={layer.layer_id}", flush=True)
-                self._attn_dbg_calls = _sv + 1
-            _dbg = getattr(self, "_attn_trace_buf", None)
-            if _dbg is None or _dbg.device != q.device:
-                import torch as _tg
-
-                _dbg = self._attn_trace_buf = _tg.zeros(
-                    32, 8, dtype=_tg.float32, device=q.device
-                )
-                self._attn_trace_ptr = _tg.zeros(
-                    1, dtype=_tg.int32, device=q.device
-                )
-            import torch as _tq2
-
-            if not _odg.environ.get("DRAMA3_IN_CAPTURE"):
-                _sv2 = int(getattr(self, "_attn_stride_dumped", 0))
-                if _sv2 == 0:
-                    self._attn_stride_dumped = 1
-                    print(
-                        f"[attn-fmt] k_cache stride={tuple(k_cache.stride())} "
-                        f"shape={tuple(k_cache.shape)} | v_cache stride={tuple(v_cache.stride())} "
-                        f"shape={tuple(v_cache.shape)} | k dtype={k_cache.dtype} v dtype={v_cache.dtype} "
-                        f"| Q stride={tuple(Q.stride())} K(strided)={tuple(K.stride())}",
-                        flush=True,
-                    )
-            _p = self._attn_trace_ptr.clamp(max=31)
-            w8 = getattr(self, "_attn_w8", None)
-            if w8 is None or w8.device != q.device:
-                import torch as _tw8
-
-                w8 = self._attn_w8 = _tw8.tensor(
-                    [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
-                    device=q.device,
-                    dtype=_tw8.float32,
-                )
-            _s0 = int(seq_lens[0].item()) if not _odg.environ.get("DRAMA3_IN_CAPTURE") else 1
-            _s0 = max(_s0 - 1, 0)
-            _k0 = K[0, 0, _s0, :8].float()
-            _v0 = V[0, 0, _s0, :8].float()
-            _o0 = out.reshape(bs, -1)[0, :8].float()
-            _kin = q.reshape(bs, -1)[0, :8].float()  # q 本身做写入侧参考
-            _vals = torch.stack(
-                [
-                    (_k0 * w8).sum(),
-                    (_v0 * w8).sum(),
-                    (_o0 * w8).sum(),
-                    seq_lens[0].float(),
-                    forward_batch.req_pool_indices[0].float(),
-                    tokens[0, 0].float(),
-                    (_kin * w8).sum(),
-                    V[0, 0, :8, 0].float().sum(),
-                ]
-            )  # [8]
-            _dbg.index_put_(
-                (
-                    _p.to(_tq2.int64),
-                    _tq2.arange(8, device=_dbg.device, dtype=_tq2.int64),
-                ),
-                _vals,
-            )
-            self._attn_trace_ptr.add_(1)
         return out.reshape(bs, Hq * Dv)
 
     def forward_decode_graph(
@@ -2890,45 +2809,6 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                import os as _okvt
-
-                if _okvt.environ.get("DRAMA3_KV_WRITE_TRACE"):
-                    _vw = getattr(self, "_kvw_w8", None)
-                    if _vw is None or _vw.device != v.device:
-                        import torch as _tkv
-
-                        _vw = self._kvw_w8 = _tkv.tensor(
-                            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
-                            device=v.device,
-                            dtype=_tkv.float32,
-                        )
-                        self._kvw_buf = _tkv.zeros(
-                            32, 3, dtype=_tkv.float32, device=v.device
-                        )
-                        self._kvw_ptr = _tkv.zeros(
-                            1, dtype=_tkv.int32, device=v.device
-                        )
-                    import torch as _tkq
-
-                    _vf = v.detach().reshape(v.shape[0], -1)[0, :8].float()
-                    _kf = k.detach().reshape(k.shape[0], -1)[0, :8].float()
-                    _loc = (
-                        forward_batch.out_cache_loc[0].float()
-                        if forward_batch.out_cache_loc is not None
-                        else torch.zeros(1, device=v.device)
-                    )
-                    _pi2 = self._kvw_ptr.clamp(max=31)
-                    _vals2 = torch.stack(
-                        [(_vf * _vw).sum(), (_kf * _vw).sum(), _loc.reshape(1)[0]]
-                    )
-                    self._kvw_buf.index_put_(
-                        (
-                            _pi2.to(_tkq.int64),
-                            _tkq.arange(3, device=_vf.device, dtype=_tkq.int64),
-                        ),
-                        _vals2,
-                    )
-                    self._kvw_ptr.add_(1)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(
@@ -3026,19 +2906,12 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
-        import os as _osd
-
-        if not self.use_mla and (
-            getattr(self, "use_native_sdpa", False)
-            or _osd.environ.get("DRAMA3_ATTN_SDPA_ALL")
-        ):
+        if not self.use_mla and getattr(self, "use_native_sdpa", False):
             # page_size < 16 (e.g. Drama 3 tower page_size=1) cannot feed the
             # aclnnFusedInferAttentionScore paged path (block_size must be a
             # multiple of 16), and the eager sdpa fallback calls .item() which
             # is illegal inside graph capture — use a graph-safe batched-gather
             # sdpa: fixed max-KV window, device-side masking, no host sync.
-            # DRAMA3_ATTN_SDPA_ALL: bisect switch — force ALL full-attn decode
-            # (incl. the backbone's page-16 layers) through this torch path.
             return self._graph_safe_sdpa_decode(q, layer, forward_batch)
 
         if not self.use_mla:
@@ -3272,41 +3145,6 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else None
                 )
-                import os as _okvt
-
-                if _okvt.environ.get("DRAMA3_KV_WRITE_TRACE"):
-                    _vw = getattr(self, "_kvw_w8", None)
-                    if _vw is None or _vw.device != v.device:
-                        import torch as _tkv
-
-                        _vw = self._kvw_w8 = _tkv.tensor(
-                            [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e7],
-                            device=v.device,
-                            dtype=_tkv.float32,
-                        )
-                        self._kvw_buf = _tkv.zeros(
-                            32, 3, dtype=_tkv.float32, device=v.device
-                        )
-                        self._kvw_ptr = _tkv.zeros(
-                            1, dtype=_tkv.int32, device=v.device
-                        )
-                    import torch as _tkq
-
-                    _vf = v.detach().reshape(v.shape[0], -1)[0, :8].float()
-                    _kf = k.detach().reshape(k.shape[0], -1)[0, :8].float()
-                    _loc = cache_loc[0].float() if cache_loc is not None else torch.zeros(1, device=v.device)
-                    _pi2 = self._kvw_ptr.clamp(max=31)
-                    _vals2 = torch.stack(
-                        [(_vf * _vw).sum(), (_kf * _vw).sum(), _loc.reshape(1)[0]]
-                    )
-                    self._kvw_buf.index_put_(
-                        (
-                            _pi2.to(_tkq.int64),
-                            _tkq.arange(3, device=_vf.device, dtype=_tkq.int64),
-                        ),
-                        _vals2,
-                    )
-                    self._kvw_ptr.add_(1)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, KVWriteLoc(cache_loc, swa_loc), k, v
                 )
