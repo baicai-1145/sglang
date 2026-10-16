@@ -85,6 +85,15 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     ):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        # Graph replay pads the batch up to the captured bucket size; the GDN
+        # decode kernel's N*HV grid launches padded programs whose
+        # cache_indices read STALE buffer contents. Stale index 0 silently
+        # overwrites slot 0's state every replay (first request's slot —
+        # exactly the observed "graph mode corrupts everything" pattern).
+        # Pad with -1: the kernel's valid_state = (index >= 0) guard skips
+        # state read/write for these rows.
+        if len(mamba_indices) < self.state_indices_list[bs - 1].shape[0]:
+            self.state_indices_list[bs - 1][len(mamba_indices) :].fill_(-1)
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]

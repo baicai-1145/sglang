@@ -194,7 +194,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         # weight taps, then SiLU (activation_mode=1).
         import os as _os
 
-        if _os.environ.get("SGLANG_NPU_GDN_NATIVE_CONV_DECODE"):
+        _native_conv = _os.environ.get("SGLANG_NPU_GDN_NATIVE_CONV_DECODE") and not (
+            getattr(self, "graph_mode", False)
+            and _os.environ.get("DRAMA3_GRAPH_CONV_ACLNN")
+        )
+        if _native_conv:
             w = self._get_conv_weights_t(layer).to(torch.float32)  # [k, dim]
             k = w.shape[0]
             import os as _odc
@@ -266,6 +270,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
         )
+
 
         import os as _os
 
