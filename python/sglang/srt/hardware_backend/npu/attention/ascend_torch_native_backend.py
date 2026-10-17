@@ -40,9 +40,20 @@ class AscendTorchNativeAttnBackend:
             else:
                 attn_bias = attn_mask + attn_bias
 
+        gqa_repeat = 1
         if enable_gqa:
-            key = key.repeat_interleave(query.size(-3) // key.size(-3), -3)
-            value = value.repeat_interleave(query.size(-3) // value.size(-3), -3)
+            # Expand the key/value heads without materialising them. The
+            # repeat_interleave here wrote four copies of every K/V head, which
+            # cost ~240us per codebook iteration on Ascend (four kernels, the
+            # largest single non-GEMM item in the tower). Reshaping the query
+            # heads into (kv_head, repeat) groups and letting the matmul
+            # broadcast is the same arithmetic with no copy.
+            gqa_repeat = query.size(-3) // key.size(-3)
+            query = query.reshape(
+                *query.shape[:-3], key.size(-3), gqa_repeat, L, query.size(-1)
+            )
+            key = key.unsqueeze(-3)
+            value = value.unsqueeze(-3)
 
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
 
@@ -52,7 +63,15 @@ class AscendTorchNativeAttnBackend:
 
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
-        return attn_weight @ value
+        output = attn_weight @ value
+        if gqa_repeat > 1:
+            output = output.reshape(
+                *output.shape[:-4],
+                output.shape[-4] * output.shape[-3],
+                output.shape[-2],
+                output.shape[-1],
+            )
+        return output
 
     def run_sdpa_forward_extend(
         self,

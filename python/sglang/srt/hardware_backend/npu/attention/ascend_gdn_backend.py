@@ -717,6 +717,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             vf32 = vf.to(torch.float32)
             bf32 = betaf.to(torch.float32)
             gexp = torch.exp(gf.to(torch.float32))
+            # beta * v is also t-invariant, and hoisting it removes one op from
+            # every recurrence step (30 GDN layers x T steps).
+            bv = bf32[:, :, None] * vf32
             _rep = Nv_ // qf32.shape[-2]
             if kf32.shape[-2] != Nv_:
                 kf32 = kf32.repeat_interleave(_rep, dim=-2)
@@ -740,7 +743,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     qt_hv = qf32[t]
                     h = h * gexp[t][:, None, None]
                     Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
-                    v_d = bf32[t][:, None] * vf32[t] - Sk
+                    v_d = bv[t] - Sk
                     h = h + torch.einsum('hk,hv->hkv', kt_hv, v_d)
                     o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
                     outs.append(o_t.to(v.dtype).unsqueeze(0))
