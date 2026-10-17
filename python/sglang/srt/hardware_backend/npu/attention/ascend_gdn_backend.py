@@ -103,6 +103,123 @@ def _gdn_recurrence_chunked(k, q, bv, gexp, h0):
     return out, cur
 
 
+_GDN_ACLNN_WARNED = False
+
+
+def _gdn_aclnn_chunk(qf, kf, vf, betaf, gf, state, seq_bounds, init_flags, scale):
+    """Run a whole prefill through aclnn ChunkGatedDeltaRule.
+
+    Contract (ops-transformer chunk_gated_delta_rule/docs/aclnnChunkGatedDeltaRule.md):
+    q,k (T,Nk,Dk) bf16 normalised; v (T,Nv,Dv) bf16; beta (T,Nv) bf16;
+    g FLOAT32 (T,Nv) with -1 <= g <= 0; initial_state (B,Nv,Dv,Dk); the op
+    applies ``scale`` to q itself. Returns the output or None when unusable.
+
+    Guards exist because both out-of-contract inputs fail *silently*: an
+    out-of-range g overflows the bf16 state, and actualSeqLengths semantics
+    (lengths vs cumulative) is only unambiguous at B == 1.
+    """
+    global _GDN_ACLNN_WARNED
+    import os as _os
+
+    def _skip(reason):
+        nonlocal_skip = getattr(_gdn_aclnn_chunk, "_seen", None)
+        if nonlocal_skip is None:
+            nonlocal_skip = _gdn_aclnn_chunk._seen = set()
+        if reason not in nonlocal_skip:
+            nonlocal_skip.add(reason)
+            print(f"[drama3] chunk GDN skipped: {reason}", flush=True)
+        return None
+
+    # Opt-in only: measured 11% relative error in the final state on this
+    # model (real tensors, T=26: |ref|max 17.8 vs max|d| 1.9, state max|d| 22.8
+    # against a state of the same magnitude). The op accumulates the state in
+    # bf16, so a 0.4% per-step error compounds over the sequence; splitting the
+    # call into 8-step chunks does not help because even the fp32
+    # initial_state is internally narrowed. Decode is unaffected because it
+    # takes one step per call from the fp32 pool.
+    # Result with it on: CER 100%. With it off: CER 0.4%.
+    if not _os.environ.get("DRAMA3_GDN_ACLNN_CHUNK"):
+        return _skip("opt-in only (bf16 state accumulation: CER 100% when on)")
+    if not hasattr(torch.ops.npu, "npu_chunk_gated_delta_rule"):
+        return _skip("op missing")
+    if len(seq_bounds) != 1:
+        return _skip(f"{len(seq_bounds)} sequences in batch")
+    s, e = seq_bounds[0]
+    if s != 0 or qf.shape[0] != e - s:
+        return _skip(f"bounds {(s, e)} vs T={qf.shape[0]}")
+    # The doc's -1 <= g <= 0 is an overflow guard, not a semantic limit: g > 0
+    # makes alpha = exp(g) > 1 and blows the bf16 state up, while very negative
+    # g merely underflows alpha to 0, exactly as fp32 does. This model really
+    # does emit g down to -91.6, so rejecting |g| > 1 would disable the whole
+    # fast path. Checking the range costs a device sync per layer (~400 ms per
+    # request at 30 layers), so it is only done behind an env var.
+    import os as _os2
+
+    gmin, gmax = -1.0, 0.0
+    if _os2.environ.get("DRAMA3_GDN_ACLNN_CHUNK_CHECK_G"):
+        gmin, gmax = float(gf.min()), float(gf.max())
+        if gmax > 0.0 or not (gmin == gmin):
+            return _skip(f"g in [{gmin:.3f}, {gmax:.3f}] would overflow")
+    if _os2.environ.get("DRAMA3_GDN_ACLNN_CHUNK_DIAG") and not getattr(
+        _gdn_aclnn_chunk, "_diag", False
+    ):
+        _gdn_aclnn_chunk._diag = True
+        qn = qf.float().norm(dim=-1)
+        kn = kf.float().norm(dim=-1)
+        print(
+            f"[diag] qnorm mean={qn.mean():.3f} min={qn.min():.3f} max={qn.max():.3f} | "
+            f"knorm mean={kn.mean():.3f} min={kn.min():.3f} max={kn.max():.3f} | "
+            f"beta [{float(betaf.min()):.3f},{float(betaf.max()):.3f}] | "
+            f"v absmax={float(vf.abs().max()):.3f} | "
+            f"g [{float(gf.min()):.3f},{float(gf.max()):.3f}] | "
+            f"scale={scale}",
+            flush=True,
+        )
+    b = 0
+    has_init = bool(init_flags[b]) if init_flags is not None and b < len(init_flags) else False
+    h0 = state[b] if has_init else torch.zeros_like(state[b])
+    init = h0.to(torch.float32).unsqueeze(0).contiguous()
+    asl = torch.tensor([e - s], dtype=torch.int32, device=qf.device)
+    out, fin = torch.ops.npu.npu_chunk_gated_delta_rule(
+        qf, kf, vf, beta=betaf, initial_state=init,
+        actual_seq_lengths=asl, scale=scale, g=gf,
+    )
+    _hit = getattr(_gdn_aclnn_chunk, "_hits", 0) + 1
+    _gdn_aclnn_chunk._hits = _hit
+    if _hit == 1:
+        print(f"[drama3] chunk GDN active: T={e - s} out {tuple(out.shape)}", flush=True)
+    if _os2.environ.get("DRAMA3_GDN_ACLNN_CHUNK_COMPARE") and not getattr(
+        _gdn_aclnn_chunk, "_cmp", False
+    ):
+        # Same-process A/B on the model's own tensors: synthetic inputs cannot
+        # tell a real semantic mismatch from bf16 noise, because |out| there is
+        # ~1e-2 and relative error is meaningless. This costs one fp32 loop.
+        _gdn_aclnn_chunk._cmp = True
+        _h = init[0].transpose(1, 2).contiguous()          # [Nv, Dk, Dv]
+        _gexp = torch.exp(gf.float())
+        _kf = kf.float().repeat_interleave(vf.shape[-2] // kf.shape[-2], dim=-2)
+        _qf = qf.float().repeat_interleave(vf.shape[-2] // qf.shape[-2], dim=-2) * scale
+        _bv = betaf.float()[:, :, None] * vf.float()
+        _outs = []
+        for _t in range(_kf.shape[0]):
+            _h.mul_(_gexp[_t][:, None, None])
+            _sk = torch.einsum("hkv,hk->hv", _h, _kf[_t])
+            _vd = _bv[_t] - _sk
+            _h.add_(torch.einsum("hk,hv->hkv", _kf[_t], _vd))
+            _outs.append(torch.einsum("hkv,hk->hv", _h, _qf[_t]).unsqueeze(0))
+        _ref = torch.cat(_outs, 0)
+        _d = (out.float() - _ref).abs()
+        print(
+            f"[cmp] real tensors T={_ref.shape[0]} |ref|max={float(_ref.abs().max()):.4f} "
+            f"|op|max={float(out.float().abs().max()):.4f} max|d|={float(_d.max()):.3e} "
+            f"mean|d|={float(_d.mean()):.3e} "
+            f"state max|d|={float((fin[0].float() - _h.transpose(1, 2)).abs().max()):.3e}",
+            flush=True,
+        )
+    state[b] = fin[0].to(state.dtype)
+    return out
+
+
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -811,8 +928,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 if hasattr(has_initial_states, "tolist")
                 else None
             )
-            for b, (s, e) in enumerate(seq_bounds):
-                # decode pool 布局 [Nv, K, V] (k行v列, exp_p 已证); aclnn doc
+            # Fast path: one fused aclnn chunk kernel for the whole prefill,
+            # measured at 0.119 ms/layer against 4.43 ms for the 32-step graph
+            # replay (T=172, Nk=16, Nv=32, Dk=Dv=128). Falls through to the
+            # replay when the op is missing or an input is out of contract.
+            _chunk_out = _gdn_aclnn_chunk(
+                qf, kf, vf, betaf, gf, state, seq_bounds, _init_flags, scale
+            )
+            if _chunk_out is not None:
+                outs.append(_chunk_out)
+            _fallback_bounds = () if _chunk_out is not None else seq_bounds
+            for b, (s, e) in enumerate(_fallback_bounds):
                 # 布局是 [Nv, Dv, Dk] — 交叉转置对齐 pool 惯例后演化.
                 # 新请求 (has_initial_states=False) 必须从零状态出发 — mamba
                 # 池 slot 不保证清零, 残留会污染整段 prefill (10 条 CER 首条
