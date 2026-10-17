@@ -29,8 +29,19 @@ def _load():
         from torch.utils.cpp_extension import load
 
         cann = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-9.1.0")
-        base = os.environ.get(
-            "SGLANG_NPU_GDN_FUSED_CONV_SRC", "/workspace/drama3-work/.tmp/customop"
+        # The tracked tree first: .tmp is gitignored and may be cleaned, which
+        # would silently drop the fused path back to the torch conv.
+        base = os.environ.get("SGLANG_NPU_GDN_FUSED_CONV_SRC") or next(
+            (
+                d
+                for d in (
+                    "/workspace/drama3-work/custom-ops",
+                    "/workspace/drama3-work/.tmp/customop",
+                )
+                if os.path.exists(os.path.join(d, "silu_conv4_bind.cpp"))
+                or os.path.exists(os.path.join(d, "silu_conv3_bind.cpp"))
+            ),
+            "/workspace/drama3-work/custom-ops",
         )
         inc = [f"{cann}/include", f"{cann}/include/aclnn"]
         ld = [
