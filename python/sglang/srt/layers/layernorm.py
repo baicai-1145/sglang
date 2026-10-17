@@ -14,6 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Optional, Tuple, Union
 
@@ -185,6 +186,10 @@ if _is_npu:
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+
+# Diagnostic: for the first N fused Gemma-norm calls, also run forward_native and
+# print the disagreement. Set SGLANG_NPU_NORM_SELFCHECK=<n>; 0 disables.
+_NORM_SELFCHECK = [int(os.environ.get("SGLANG_NPU_NORM_SELFCHECK", "0") or 0)]
 
 
 @lru_cache(maxsize=1)
@@ -1105,16 +1110,43 @@ class GemmaRMSNorm(BaseFusedOp):
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
+        # (1 + weight) in fp32, built once on first use. Rebuilding it per call
+        # costs two extra kernels (cast + add) per norm layer, which is
+        # measurable at decode time.
+        self._fused_gamma_cache: Optional[torch.Tensor] = None
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
         self.weight.weight_loader = self._weight_loader
+
+    def _fused_gamma(self) -> torch.Tensor:
+        """(1 + weight) in fp32, cached across calls.
+
+        fp32 is deliberate, not an oversight. ``npu_rms_norm`` with an fp32 gain
+        reproduces ``forward_native`` bit-exactly; with a gain cast to the
+        activation dtype ~20% of the output elements shift by one bf16 ULP, and
+        that is enough to flip MoE top-k routing downstream (measured: mean CER
+        18.6% -> 98.8% on the Drama-3 acceptance set).
+
+        Derived from ``self.weight`` rather than the ``gemma_weight`` buffer:
+        ``gemma_weight`` is only maintained by ``_weight_loader``, so a loader
+        that writes ``param.data`` directly would leave it stale.
+        """
+        gamma = self._fused_gamma_cache
+        src = self.weight
+        if gamma is None or gamma.device != src.device or gamma.dtype != torch.float32:
+            with torch.no_grad():
+                gamma = (src.detach().float() + 1.0).contiguous()
+            self._fused_gamma_cache = gamma
+        return gamma
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
+        # The fused NPU norm keeps its own fp32 copy of (1 + weight).
+        self._fused_gamma_cache = None
 
     def _forward_impl(
         self,
@@ -1234,22 +1266,49 @@ class GemmaRMSNorm(BaseFusedOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
+        gamma = self._fused_gamma()
+        check = _NORM_SELFCHECK[0] > 0 and not torch_npu.npu.is_current_stream_capturing()
+        if check:
+            _NORM_SELFCHECK[0] -= 1
+            x_bak = x.clone()
+            res_bak = None if residual is None else residual.clone()
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
-                gamma = self.gemma_weight.to(x.dtype)
-                norm_out, _, residual = torch_npu.npu_add_rms_norm(
-                    residual, x, gamma, self.variance_epsilon
-                )
-            else:
-                norm_out, residual = add_gemma_rms_norm(
-                    x, self.weight, residual, self.variance_epsilon
-                )
-            return norm_out, residual
+            # Bit-exact vs forward_native: same bf16 residual add, then one
+            # aclnn op doing fp32 normalize * fp32 gain in place of the
+            # 7-kernel torch decomposition. npu_add_rms_norm cannot be used
+            # here because it rejects an fp32 gain and its bf16 gain path is
+            # not bit-exact.
+            residual = residual + x
+            norm_out, _ = torch_npu.npu_rms_norm(
+                residual, gamma, self.variance_epsilon
+            )
+            result = (norm_out, residual)
+        elif x.dim() != 2:
+            original_shape = x.shape
+            norm_out, _ = torch_npu.npu_rms_norm(
+                x.contiguous().reshape(-1, original_shape[-1]),
+                gamma,
+                self.variance_epsilon,
+            )
+            result = norm_out.reshape(original_shape)
+        else:
+            norm_out, _ = torch_npu.npu_rms_norm(x, gamma, self.variance_epsilon)
+            result = norm_out
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-        return x
+        if check:
+            with torch.no_grad():
+                ref = self.forward_native(x_bak, res_bak)
+                ref = ref[0] if isinstance(ref, tuple) else ref
+                got = result[0] if isinstance(result, tuple) else result
+                ndiff = int((got.float() != ref.float()).sum())
+                print(
+                    f"[normcheck] shape={tuple(x.shape)} bitdiff={ndiff}/{got.numel()} "
+                    f"max|diff|={float((got.float() - ref.float()).abs().max()):.3e}",
+                    flush=True,
+                )
+        return result
 
     def forward_xpu(
         self,
