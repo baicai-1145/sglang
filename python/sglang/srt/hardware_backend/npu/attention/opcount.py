@@ -56,11 +56,15 @@ class _Counter(TorchDispatchMode):
             #   0 this method
             #   1 torch dispatch plumbing
             #   2.. user code -> keep the first frame inside sglang
-            site = "?"
-            for fr in traceback.extract_stack()[:-2]:
-                if "sglang" in fr.filename and "opcount" not in fr.filename:
-                    site = f"{os.path.basename(fr.filename)}:{fr.lineno}"
-                    break
+            # Keep three innermost sglang frames: a single frame lands on
+            # call-site lines (e.g. a bare `return some_call(...)`) because
+            # torch_npu inserts frames between dispatch and user code.
+            frames = [
+                f"{os.path.basename(fr.filename)}:{fr.lineno}"
+                for fr in reversed(traceback.extract_stack()[:-2])
+                if "sglang" in fr.filename and "opcount" not in fr.filename
+            ]
+            site = " <- ".join(frames[:3]) if frames else "?"
             self.hits[(name, site)] += 1
         return func(*args, **(kwargs or {}))
 
