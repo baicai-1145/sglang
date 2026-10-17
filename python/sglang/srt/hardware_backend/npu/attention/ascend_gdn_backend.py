@@ -414,7 +414,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         if (
             _native_conv
             and _fop is not None
-            and layer.bias is not None
             and mixed_qkv.dim() == 2
             and mixed_qkv.dtype == torch.bfloat16
             and conv_states.dtype == torch.bfloat16
@@ -424,8 +423,27 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             # to that path for B in {1,3,8} and D in {2048,4096,8192}; the
             # history roll stays in torch because it is a pool write, not a
             # compute kernel.
+            if getattr(self, "_fused_conv_note", 0) == 0:
+                self._fused_conv_note = 1
+                print(
+                    f"[siluconv] FUSED path active: x={mixed_qkv.dtype} "
+                    f"conv={conv_states.dtype} bias={None if layer.bias is None else layer.bias.dtype} "
+                    f"xdim={mixed_qkv.dim()}",
+                    flush=True,
+                )
             _w32 = self._get_conv_weights_t(layer).to(torch.float32)
-            _b32 = layer.bias.to(torch.float32)
+            if layer.bias is None:
+                # This model's conv has no bias. The kernel needs an operand,
+                # so pass a cached all-zero vector: exactly neutral, read-only,
+                # never written, so sharing it across layers is safe.
+                _b32 = getattr(self, "_conv_zero_bias", None)
+                if _b32 is None or _b32.numel() != _w32.shape[1]:
+                    _b32 = torch.zeros(
+                        _w32.shape[1], dtype=torch.float32, device=mixed_qkv.device
+                    )
+                    self._conv_zero_bias = _b32
+            else:
+                _b32 = layer.bias.to(torch.float32)
             _kk = _w32.shape[0]
             _slots = cache_indices
             _hist_bf = conv_states[_slots]
@@ -436,6 +454,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).to(conv_states.dtype)
             mixed_qkv = _y
         elif _native_conv:
+            if getattr(self, "_fused_conv_note", 0) == 0:
+                self._fused_conv_note = 1
+                print(
+                    f"[siluconv] FELL BACK to torch: op={'yes' if _fop is not None else 'no'} "
+                    f"x={mixed_qkv.dtype} conv={conv_states.dtype} "
+                    f"bias={None if layer.bias is None else layer.bias.dtype} "
+                    f"xdim={mixed_qkv.dim()}",
+                    flush=True,
+                )
             w = self._get_conv_weights_t(layer).to(torch.float32)  # [k, dim]
             k = w.shape[0]
             import os as _odc
