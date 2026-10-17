@@ -42,6 +42,21 @@ def _load():
             f"-Wl,-rpath,{cann}/opp/vendors/customize/op_api/lib",
         ]
 
+        # v3: same math, weights widened bf16->fp32 inside the kernel, so the
+        # caller stops paying a 128 KiB cast per layer per step.
+        src3 = os.path.join(base, "silu_conv3_bind.cpp")
+        if os.path.exists(src3):
+            mod = load(
+                name="silu_conv3_ext",
+                sources=[src3],
+                extra_include_paths=inc,
+                extra_ldflags=ld,
+                verbose=False,
+            )
+            _IMPL = ("v3", mod.silu_conv_decode3)
+            print("[siluconv] fused conv v3 (bf16 weights, in-kernel widen) loaded", flush=True)
+            return _IMPL
+
         # Prefer the two-output variant: it also performs the history roll.
         src2 = os.path.join(base, "silu_conv2_bind.cpp")
         if os.path.exists(src2):
@@ -90,13 +105,21 @@ def fused_conv(x, hist, w, bias, stream):
     if impl is None:
         return None
     kind, fn = impl
-    if kind == "two_out":
-        y, hist_out = fn(x, hist, w, bias, stream)
-        return y, hist_out
+    if kind == "v3":
+        # v3 widens bf16 weights inside the kernel, so the caller hands over the
+        # checkpoint tensors untouched (no per-step fp32 cast).
+        return fn(x, hist, w, bias, stream)
 
     import torch
 
-    y = fn(x, hist, w, bias, stream)
+    # v2/v1 take fp32 weights; bf16 -> fp32 is a lossless widening.
+    w32 = w if w.dtype == torch.float32 else w.to(torch.float32)
+    b32 = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
+    if kind == "two_out":
+        y, hist_out = fn(x, hist, w32, b32, stream)
+        return y, hist_out
+
+    y = fn(x, hist, w32, b32, stream)
     hist_out = torch.cat([hist[:, 1:, :], x.unsqueeze(1)], dim=1)
     return y, hist_out
 

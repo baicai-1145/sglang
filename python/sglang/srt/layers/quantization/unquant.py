@@ -497,6 +497,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if x.device.type == "npu":
+            # None of the platform branches below can apply on NPU: AMX is Intel
+            # CPU, aiter is AMD GPU and cutedsl is CUDA. Taking the plain GEMM
+            # here skips two function calls (use_intel_amx_backend,
+            # get_bf16_gemm_backend().is_cutedsl) on every linear of every layer
+            # of every frame - about 14.4k calls per request.
+            return F.linear(x, layer.weight, bias)
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

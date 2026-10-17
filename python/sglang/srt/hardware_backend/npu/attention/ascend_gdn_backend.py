@@ -220,6 +220,40 @@ def _gdn_aclnn_chunk(qf, kf, vf, betaf, gf, state, seq_bounds, init_flags, scale
     return out
 
 
+
+# Launch-time flags, read once. DRAMA3_IN_CAPTURE is deliberately NOT hoisted:
+# npu_cudagraph_backend sets it at runtime during capture. It is always the
+# second operand of an `and` chain, so it stays unevaluated while these are off.
+_ENV_DEBUG_FRAMES = bool(__import__("os").environ.get("DRAMA3_DEBUG_FRAMES"))
+_ENV_NATIVE_CONV = bool(__import__("os").environ.get("SGLANG_NPU_GDN_NATIVE_CONV_DECODE"))
+_ENV_GRAPH_CONV_ACLNN = bool(__import__("os").environ.get("DRAMA3_GRAPH_CONV_ACLNN"))
+_ENV_DUMP_CONVDEC = bool(__import__("os").environ.get("DRAMA3_DUMP_CONVDEC"))
+_ENV_GDN_DECODE_TORCH = bool(__import__("os").environ.get("DRAMA3_GDN_DECODE_TORCH"))
+_ENV_DUMP_GDNSTEP = bool(__import__("os").environ.get("DRAMA3_DUMP_GDNSTEP"))
+
+_FC_PAIR = None
+_FC_TRIED = False
+
+
+def _fused_conv_pair():
+    """(fused_conv, conv_stream) once per process, or None.
+
+    Resolving this per layer cost an import statement, an is_available() call and
+    several attribute lookups on every GDN layer of every frame. Host-side cost
+    is measurable here (~0.5-1.5 us per call): removing ~8 ms of dead-code calls
+    from the linear path moved the end-to-end request by the same 8 ms.
+    """
+    global _FC_PAIR, _FC_TRIED
+    if not _FC_TRIED:
+        _FC_TRIED = True
+        try:
+            from .silu_conv_op import conv_stream, fused_conv, is_available
+
+            _FC_PAIR = (fused_conv, conv_stream) if is_available() else False
+        except Exception:  # noqa: BLE001
+            _FC_PAIR = False
+    return _FC_PAIR or None
+
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -378,7 +412,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
+        if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             cs = conv_states[cache_indices]
             bad = int((~torch.isfinite(cs)).sum())
             if bad:
@@ -399,18 +433,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         # weight taps, then SiLU (activation_mode=1).
         import os as _os
 
-        _native_conv = _os.environ.get("SGLANG_NPU_GDN_NATIVE_CONV_DECODE") and not (
+        _native_conv = _ENV_NATIVE_CONV and not (
             getattr(self, "graph_mode", False)
-            and _os.environ.get("DRAMA3_GRAPH_CONV_ACLNN")
+            and _ENV_GRAPH_CONV_ACLNN
         )
-        _fop = None
-        if _native_conv:
-            try:
-                from .silu_conv_op import conv_stream, fused_conv, is_available
-
-                _fop = fused_conv if is_available() else None
-            except Exception:
-                _fop = None
+        _pair = _fused_conv_pair() if _native_conv else None
+        _fop = _pair[0] if _pair is not None else None
         if (
             _native_conv
             and _fop is not None
@@ -431,7 +459,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     f"xdim={mixed_qkv.dim()}",
                     flush=True,
                 )
-            _w32 = self._get_conv_weights_t(layer).to(torch.float32)
+            # Hand the op the checkpoint tensors as-is: v3 widens bf16 -> fp32
+            # inside the kernel (lossless), which removes a 128 KiB cast kernel
+            # per GDN layer per decode step. The wrapper casts for older variants.
+            _w32 = self._get_conv_weights_t(layer)
             if layer.bias is None:
                 # This model's conv has no bias. The kernel needs an operand,
                 # so pass a cached all-zero vector: exactly neutral, read-only,
@@ -439,15 +470,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 _b32 = getattr(self, "_conv_zero_bias", None)
                 if _b32 is None or _b32.numel() != _w32.shape[1]:
                     _b32 = torch.zeros(
-                        _w32.shape[1], dtype=torch.float32, device=mixed_qkv.device
+                        _w32.shape[1], dtype=_w32.dtype, device=mixed_qkv.device
                     )
                     self._conv_zero_bias = _b32
             else:
-                _b32 = layer.bias.to(torch.float32)
+                _b32 = layer.bias
             _kk = _w32.shape[0]
             _slots = cache_indices
             _hist_bf = conv_states[_slots]
-            _y, _hout = _fop(mixed_qkv, _hist_bf, _w32, _b32, conv_stream())
+            _y, _hout = _fop(mixed_qkv, _hist_bf, _w32, _b32, _pair[1]())
             # The op returns the rolled window, so the caller only does the
             # indexed pool write instead of 3 slices + stack + cast.
             conv_states[_slots] = _hout
@@ -465,7 +496,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             w = self._get_conv_weights_t(layer).to(torch.float32)  # [k, dim]
             k = w.shape[0]
             import os as _odc
-            if _odc.environ.get("DRAMA3_DUMP_CONVDEC") and not _odc.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
+            if _ENV_DUMP_CONVDEC and not _odc.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
                 _st = int(getattr(self, "_convdec_dump_step", 0))
                 if _st < 40:
                     import torch as _td
@@ -522,7 +553,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
         import os as _ogd2
-        if _ogd2.environ.get("DRAMA3_GDN_DECODE_TORCH"):
+        if _ENV_GDN_DECODE_TORCH:
             # graph-bisect: 纯 torch 逐步 GDN (与 prefill torch 同公式), 无 triton.
             # q/k/v: [1, bs, H, K] / [1, bs, HV, V]; a/b: [bs, HV]
             import torch as _td
@@ -566,7 +597,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DUMP_GDNSTEP") and not _os.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
+        if _ENV_DUMP_GDNSTEP and not _os.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
             # GDN decode 数值取证: 首个 GDN 层 (L0), 前 40 步, dump kernel 全输入+输出+状态
             _st = int(getattr(self, "_gdn_dump_step", 0))
             if _st < 40:
@@ -588,7 +619,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     print(f"[gdn-dump] L0 step0 saved q{tuple(query.shape)} k{tuple(key.shape)} v{tuple(value.shape)} a{tuple(a.shape)}", flush=True)
                 self._gdn_dump_step = _st + 1
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
+        if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] decode L{layer.layer_id}: q_nan={bool(query.isnan().any())} "
                 f"v_nan={bool(value.isnan().any())} a_nan={bool(a.isnan().any())} "
@@ -690,7 +721,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             import os as _os
 
             keep_native_hist = bool(
-                _os.environ.get("SGLANG_NPU_GDN_NATIVE_CONV_DECODE")
+                _ENV_NATIVE_CONV
             )
             if keep_native_hist:
                 # The op does NOT write final taps back into the passed
@@ -838,7 +869,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             import os as _os
 
-            if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
+            if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
                 w = self._get_conv_weights_t(layer)
                 print(
                     f"[drama3] gdn gating: g_nan={bool(g.isnan().any())} "
@@ -896,7 +927,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
+        if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] gdn extend out: nan={bool(core_attn_out.isnan().any())} "
                 f"absmax={float(core_attn_out.abs().max()):.3f} "
@@ -1053,7 +1084,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         import os as _os
 
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
+        if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
             print(
                 f"[drama3] chunk_gdn: q_max={float(qf.abs().max()):.3f} "
                 f"k_max={float(kf.abs().max()):.3f} v_max={float(vf.abs().max()):.3f} "
