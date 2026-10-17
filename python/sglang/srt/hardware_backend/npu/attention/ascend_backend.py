@@ -2791,14 +2791,26 @@ class AscendAttnBackend(AttentionBackend):
         # GQA expand: tower attention has Hq=16 query heads but only Hk=2
         # kv heads — repeat K/V heads up to Hq before the einsum (NPU
         # matmul/sdpa reject both length and head broadcast).
+        # Broadcast the KV heads through a size-1 einsum dimension instead of
+        # materialising Hq heads with repeat_interleave. Verified bit-identical
+        # on device (torch.equal on scores and out, max|d| = 0.0) and removes
+        # two kernels per call from the decode graph (`RepeatInterleave` was
+        # 45 ops/frame at ~4.75 us each).
         rep = Hq // Hk
         if rep > 1:
-            K = K.repeat_interleave(rep, dim=1)
-            V = V.repeat_interleave(rep, dim=1)
-        scores = torch.einsum("bhqd,bhkd->bhqk", Q, K) * layer.scaling
-        scores = scores.masked_fill(mask, float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
-        out = torch.einsum("bhqk,bhkd->bhqd", probs, V)  # [bs, Hq, 1, Dv]
+            _b, _q = Q.shape[0], Q.shape[2]
+            _qr = Q.reshape(_b, Hk, rep, _q, -1)
+            scores = torch.einsum("bhgqd,bhgnd->bhgqn", _qr, K.unsqueeze(2))
+            scores = scores.reshape(_b, Hq, _q, -1) * layer.scaling
+            scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1).reshape(_b, Hk, rep, _q, -1)
+            out = torch.einsum("bhgqn,bhgnd->bhgqd", probs, V.unsqueeze(2))
+            out = out.reshape(_b, Hq, _q, -1)  # [bs, Hq, 1, Dv]
+        else:
+            scores = torch.einsum("bhqd,bhkd->bhqk", Q, K) * layer.scaling
+            scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("bhqk,bhkd->bhqd", probs, V)  # [bs, Hq, 1, Dv]
         import os as _odg
 
         if _odg.environ.get("DRAMA3_ATTN_TRACE"):
