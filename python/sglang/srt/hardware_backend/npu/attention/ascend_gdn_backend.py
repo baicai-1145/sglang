@@ -741,12 +741,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 for t in range(s, e):
                     kt_hv = kf32[t]
                     qt_hv = qf32[t]
-                    h = h * gexp[t][:, None, None]
+                    # In-place: same kernels, no 4 MB-per-step reallocation.
+                    h.mul_(gexp[t][:, None, None])
                     Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
                     v_d = bv[t] - Sk
-                    h = h + torch.einsum('hk,hv->hkv', kt_hv, v_d)
+                    h.add_(torch.einsum('hk,hv->hkv', kt_hv, v_d))
                     o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
-                    outs.append(o_t.to(v.dtype).unsqueeze(0))
+                    # No per-step cast: the trailing cat(...).to(v.dtype) rounds
+                    # each element to bf16 exactly once either way, so this is
+                    # bit-identical and saves one launch per timestep per layer
+                    # (30 GDN layers x T steps x ~13 us of dispatch each).
+                    outs.append(o_t.unsqueeze(0))
                 state[b] = h.to(state.dtype)
         else:
             for b, (s, e) in enumerate(seq_bounds):
