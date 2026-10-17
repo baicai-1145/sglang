@@ -403,7 +403,39 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             getattr(self, "graph_mode", False)
             and _os.environ.get("DRAMA3_GRAPH_CONV_ACLNN")
         )
+        _fop = None
         if _native_conv:
+            try:
+                from .silu_conv_op import conv_stream, get_op
+
+                _fop = get_op()
+            except Exception:
+                _fop = None
+        if (
+            _native_conv
+            and _fop is not None
+            and layer.bias is not None
+            and mixed_qkv.dim() == 2
+            and mixed_qkv.dtype == torch.bfloat16
+            and conv_states.dtype == torch.bfloat16
+        ):
+            # Self-built Ascend C kernel (silu_conv_decode): a single launch
+            # replaces the ~17 torch kernels below. Verified bitwise-identical
+            # to that path for B in {1,3,8} and D in {2048,4096,8192}; the
+            # history roll stays in torch because it is a pool write, not a
+            # compute kernel.
+            _w32 = self._get_conv_weights_t(layer).to(torch.float32)
+            _b32 = layer.bias.to(torch.float32)
+            _kk = _w32.shape[0]
+            _slots = cache_indices
+            _hist_bf = conv_states[_slots]
+            _y = _fop(mixed_qkv, _hist_bf, _w32, _b32, conv_stream())
+            conv_states[_slots] = torch.stack(
+                [_hist_bf[:, jj, :] for jj in range(1, _kk - 1)] + [mixed_qkv],
+                dim=1,
+            ).to(conv_states.dtype)
+            mixed_qkv = _y
+        elif _native_conv:
             w = self._get_conv_weights_t(layer).to(torch.float32)  # [k, dim]
             k = w.shape[0]
             import os as _odc
