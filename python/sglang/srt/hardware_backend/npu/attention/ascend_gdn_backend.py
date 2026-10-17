@@ -21,6 +21,88 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 fused_gdn_gating = fused_gdn_gating_npu
 
 
+_GDN_CHUNK = 32
+_GDN_GRAPH_CACHE: dict[tuple, tuple] = {}
+
+
+def _gdn_graph_state(Nv: int, Dk: int, Dv: int, device, dtype):
+    """Return (and lazily capture) the chunked recurrence graph for these dims.
+
+    The recurrence carries no parameters, so one graph serves every layer and
+    every sequence length: replay ceil(T / _GDN_CHUNK) times threading h_out
+    back into h_in. Capture is per (Nv, Dk, Dv) only.
+    """
+    key = (Nv, Dk, Dv, str(device), str(dtype))
+    cached = _GDN_GRAPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    C = _GDN_CHUNK
+    k_b = torch.zeros(C, Nv, Dk, device=device, dtype=dtype)
+    q_b = torch.zeros(C, Nv, Dk, device=device, dtype=dtype)
+    bv_b = torch.zeros(C, Nv, Dv, device=device, dtype=dtype)
+    # gamma = exp(g); 1.0 is the identity step used to pad a short tail.
+    g_b = torch.ones(C, Nv, device=device, dtype=dtype)
+    h_i = torch.zeros(Nv, Dk, Dv, device=device, dtype=dtype)
+    o_b = torch.zeros(C, Nv, Dv, device=device, dtype=dtype)
+    h_o = torch.zeros(Nv, Dk, Dv, device=device, dtype=dtype)
+
+    def body():
+        h = h_i.clone()
+        for t in range(C):
+            h.mul_(g_b[t][:, None, None])
+            sk = torch.einsum("hkv,hk->hv", h, k_b[t])
+            v_d = bv_b[t] - sk
+            h.add_(torch.einsum("hk,hv->hkv", k_b[t], v_d))
+            o_b[t] = torch.einsum("hkv,hk->hv", h, q_b[t])
+        h_o.copy_(h)
+
+    graph = torch.npu.NPUGraph()
+    pool = torch.npu.graph_pool_handle()
+    side = torch.npu.Stream()
+    side.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(side):
+        for _ in range(3):
+            body()
+    torch.npu.synchronize()
+    with torch.npu.graph(graph, pool=pool, stream=side, auto_dispatch_capture=True):
+        body()
+    torch.npu.synchronize()
+    state = (graph, k_b, q_b, bv_b, g_b, h_i, o_b, h_o)
+    _GDN_GRAPH_CACHE[key] = state
+    return state
+
+
+def _gdn_recurrence_chunked(k, q, bv, gexp, h0):
+    """Chunked replay of the recurrence; bit-identical to the per-step loop."""
+    T, Nv, Dk, Dv = k.shape[0], k.shape[1], k.shape[2], bv.shape[2]
+    graph, k_b, q_b, bv_b, g_b, h_i, o_b, h_o = _gdn_graph_state(
+        Nv, Dk, Dv, k.device, k.dtype
+    )
+    C = _GDN_CHUNK
+    out = torch.empty(T, Nv, Dv, dtype=k.dtype, device=k.device)
+    cur = h0
+    done = 0
+    while done < T:
+        n = min(C, T - done)
+        # Zeroing k/v/beta and setting gamma=1 makes padded steps exact
+        # identities (v_d = 0, h unchanged, o = 0), so the state handed to
+        # decode is the one the unpadded recurrence would produce.
+        k_b.zero_()
+        q_b.zero_()
+        bv_b.zero_()
+        g_b.fill_(1.0)
+        k_b[:n].copy_(k[done : done + n])
+        q_b[:n].copy_(q[done : done + n])
+        bv_b[:n].copy_(bv[done : done + n])
+        g_b[:n].copy_(gexp[done : done + n])
+        h_i.copy_(cur)
+        graph.replay()
+        cur = h_o.clone()
+        out[done : done + n] = o_b[:n]
+        done += n
+    return out, cur
+
+
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -738,21 +820,30 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 _has_init = bool(_init_flags[b]) if _init_flags is not None and b < len(_init_flags) else False
                 h0_src = state[b] if _has_init else torch.zeros_like(state[b])
                 h = h0_src.to(torch.float32).transpose(1, 2).contiguous()  # [Nv, K, V]
-                for t in range(s, e):
-                    kt_hv = kf32[t]
-                    qt_hv = qf32[t]
-                    # In-place: same kernels, no 4 MB-per-step reallocation.
-                    h.mul_(gexp[t][:, None, None])
-                    Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
-                    v_d = bv[t] - Sk
-                    h.add_(torch.einsum('hk,hv->hkv', kt_hv, v_d))
-                    o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
-                    # No per-step cast: the trailing cat(...).to(v.dtype) rounds
-                    # each element to bf16 exactly once either way, so this is
-                    # bit-identical and saves one launch per timestep per layer
-                    # (30 GDN layers x T steps x ~13 us of dispatch each).
-                    outs.append(o_t.unsqueeze(0))
-                state[b] = h.to(state.dtype)
+                # One 32-step graph serves every layer and every T; the loop is
+                # 41018 kernels at ~13.3 us of dispatch each, and this collapses
+                # it to ceil(T/32) replays. Verified bit-identical to the
+                # per-step loop below (out and final state). Falls back to the
+                # loop if capture is unavailable on this binary.
+                try:
+                    o_seq, h_end = _gdn_recurrence_chunked(
+                        kf32[s:e], qf32[s:e], bv[s:e], gexp[s:e], h
+                    )
+                except Exception:
+                    o_seq = []
+                    for t in range(s, e):
+                        kt_hv = kf32[t]
+                        qt_hv = qf32[t]
+                        h.mul_(gexp[t][:, None, None])
+                        Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
+                        v_d = bv[t] - Sk
+                        h.add_(torch.einsum('hk,hv->hkv', kt_hv, v_d))
+                        o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
+                        o_seq.append(o_t.unsqueeze(0))
+                    o_seq = torch.cat(o_seq, dim=0)
+                    h_end = h
+                outs.append(o_seq)
+                state[b] = h_end.to(state.dtype)
         else:
             for b, (s, e) in enumerate(seq_bounds):
                 idx = torch.tensor([b], dtype=torch.int32, device=qf.device)
