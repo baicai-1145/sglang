@@ -1625,7 +1625,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            replay_kwargs = {}
+            if self.model_runner.device == "npu":
+                # Rebind IFA host-side KV lengths captured as python lists
+                # (see NPUCudaGraphBackend.replay); one dict broadcasts to
+                # every recorded IFA call via update_capture_record.
+                sl = forward_batch.seq_lens
+                if sl is not None:
+                    sl_list = sl.detach().cpu().int().tolist()
+                    cumsum = []
+                    acc = 0
+                    for x in sl_list:
+                        acc += x
+                        cumsum.append(acc)
+                    replay_kwargs["graph_input_update"] = {
+                        "actual_seq_lengths": cumsum,
+                        "actual_seq_lengths_kv": sl_list,
+                    }
+            output = self.backend.replay(
+                self._replay_graph_key, forward_batch, **replay_kwargs
+            )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

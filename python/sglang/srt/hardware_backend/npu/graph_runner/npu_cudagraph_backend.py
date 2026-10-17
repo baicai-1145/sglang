@@ -158,7 +158,15 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._graphs[shape_key].replay()
+        graph = self._graphs[shape_key]
+        # DRAMA3 graph-fidelity fix: IFA captured `actual_seq_lengths(_kv)` as
+        # Host-side python lists (frozen into the executor at capture time).
+        # Rebind them via the official NPUGraph.update mechanism before every
+        # replay, otherwise the graph reads capture-time KV lengths forever.
+        upd = kwargs.get("graph_input_update")
+        if upd is not None and getattr(graph, "auto_dispatch_capture", False):
+            graph.update(cpu_update_input=[upd])
+        graph.replay()
         return self._outputs[shape_key]
 
     def replay_with_input_update(
