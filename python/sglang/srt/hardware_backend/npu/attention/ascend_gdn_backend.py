@@ -744,9 +744,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     h = h * gexp[t][:, None, None]
                     Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
                     v_d = bv[t] - Sk
-                    h = h + torch.einsum('hk,hv->hkv', kt_hv, v_d)
+                    # baddbmm fuses "h_dec + k (x) v_d" into one kernel; the
+                    # multiply by 1.0 and the add are exact, so this stays
+                    # bit-identical to the separate matmul + add.
+                    h = torch.baddbmm(
+                        h, kt_hv.unsqueeze(-1), v_d.unsqueeze(-2)
+                    )
                     o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
-                    outs.append(o_t.to(v.dtype).unsqueeze(0))
+                    # Keep fp32 here; the trailing cat(...).to(v.dtype) casts the
+                    # whole block once instead of once per timestep.
+                    outs.append(o_t.unsqueeze(0))
                 state[b] = h.to(state.dtype)
         else:
             for b, (s, e) in enumerate(seq_bounds):
