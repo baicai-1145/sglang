@@ -706,6 +706,21 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             # (与 decode kernel 同公式: v_d = β·v − (h·e^g)·k; h += k⊗v_d;
             #  o = h·q·scale; 状态 [Nv, Dk, Dv] k行v列, fp32 累积).
             Nv_, Dk_, Dv_ = vf.shape[-2], kf.shape[-1], vf.shape[-1]
+            # Hoist everything that does not depend on t out of the recurrence.
+            # This path is host-bound (~11us of dispatch per op, 24% device
+            # busy), and the per-timestep casts / exp / GQA expand were 8 of the
+            # ~15 ops per step per layer, paid 30 GDN layers x T timesteps.
+            # These hoists are elementwise and therefore bit-identical to the
+            # per-row form.
+            qf32 = qf.to(torch.float32) * scale
+            kf32 = kf.to(torch.float32)
+            vf32 = vf.to(torch.float32)
+            bf32 = betaf.to(torch.float32)
+            gexp = torch.exp(gf.to(torch.float32))
+            _rep = Nv_ // qf32.shape[-2]
+            if kf32.shape[-2] != Nv_:
+                kf32 = kf32.repeat_interleave(_rep, dim=-2)
+                qf32 = qf32.repeat_interleave(_rep, dim=-2)
             _init_flags = (
                 has_initial_states.tolist()
                 if hasattr(has_initial_states, "tolist")
@@ -721,17 +736,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 h0_src = state[b] if _has_init else torch.zeros_like(state[b])
                 h = h0_src.to(torch.float32).transpose(1, 2).contiguous()  # [Nv, K, V]
                 for t in range(s, e):
-                    qt = qf[t].to(torch.float32) * scale
-                    kt = kf[t].to(torch.float32)
-                    vt = vf[t].to(torch.float32)
-                    bt = betaf[t].to(torch.float32)
-                    gt = gf[t].to(torch.float32)
-                    rep = Nv_ // qt.shape[-2]
-                    kt_hv = kt.repeat_interleave(rep, dim=-2) if kt.shape[-2] != Nv_ else kt
-                    qt_hv = qt.repeat_interleave(rep, dim=-2) if qt.shape[-2] != Nv_ else qt
-                    h = h * torch.exp(gt)[:, None, None]
+                    kt_hv = kf32[t]
+                    qt_hv = qf32[t]
+                    h = h * gexp[t][:, None, None]
                     Sk = torch.einsum('hkv,hk->hv', h, kt_hv)
-                    v_d = bt[:, None] * vt - Sk
+                    v_d = bf32[t][:, None] * vf32[t] - Sk
                     h = h + torch.einsum('hk,hv->hkv', kt_hv, v_d)
                     o_t = torch.einsum('hkv,hk->hv', h, qt_hv)
                     outs.append(o_t.to(v.dtype).unsqueeze(0))
