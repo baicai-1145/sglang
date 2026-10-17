@@ -42,6 +42,21 @@ def _load():
             f"-Wl,-rpath,{cann}/opp/vendors/customize/op_api/lib",
         ]
 
+        # v4: takes the mamba pool and its slot indices, so the kernel does the
+        # gather and the in-place roll itself. One device kernel per GDN layer.
+        src4 = os.path.join(base, "silu_conv4_bind.cpp")
+        if os.path.exists(src4):
+            mod = load(
+                name="silu_conv4_ext",
+                sources=[src4],
+                extra_include_paths=inc,
+                extra_ldflags=ld,
+                verbose=False,
+            )
+            _IMPL = ("v4", mod.silu_conv_decode4)
+            print("[siluconv] fused conv v4 (pool in-place) loaded", flush=True)
+            return _IMPL
+
         # v3: same math, weights widened bf16->fp32 inside the kernel, so the
         # caller stops paying a 128 KiB cast per layer per step.
         src3 = os.path.join(base, "silu_conv3_bind.cpp")
@@ -95,33 +110,37 @@ def is_available():
     return _load() is not None
 
 
-def fused_conv(x, hist, w, bias, stream):
-    """Return (y, hist_out) or None when the fused op is unavailable.
+def fused_conv(x, pool, indices, w, bias, stream):
+    """Return y, updating the history window in ``pool``; None if unavailable.
 
-    ``hist`` is the [B, k-1, D] history window, ``bias`` an fp32 [D] tensor
-    (callers pass a zero vector when the conv has no bias).
+    ``pool`` is the [S, k-1, D] mamba conv state, ``indices`` the [B] slots to
+    use. v4 does the gather and the roll inside the kernel; older variants get
+    the same treatment emulated here so the call site never changes.
     """
     impl = _load()
     if impl is None:
         return None
     kind, fn = impl
-    if kind == "v3":
-        # v3 widens bf16 weights inside the kernel, so the caller hands over the
-        # checkpoint tensors untouched (no per-step fp32 cast).
-        return fn(x, hist, w, bias, stream)
+    if kind == "v4":
+        # The kernel widens bf16 weights itself and rolls the window in place.
+        return fn(x, pool, w, bias, indices, stream)
 
     import torch
 
-    # v2/v1 take fp32 weights; bf16 -> fp32 is a lossless widening.
-    w32 = w if w.dtype == torch.float32 else w.to(torch.float32)
-    b32 = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
-    if kind == "two_out":
-        y, hist_out = fn(x, hist, w32, b32, stream)
-        return y, hist_out
-
-    y = fn(x, hist, w32, b32, stream)
-    hist_out = torch.cat([hist[:, 1:, :], x.unsqueeze(1)], dim=1)
-    return y, hist_out
+    hist = pool[indices]
+    if kind == "v3":
+        y, hist_out = fn(x, hist, w, bias, stream)
+    else:
+        # v2/v1 take fp32 weights; bf16 -> fp32 is a lossless widening.
+        w32 = w if w.dtype == torch.float32 else w.to(torch.float32)
+        b32 = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
+        if kind == "two_out":
+            y, hist_out = fn(x, hist, w32, b32, stream)
+        else:
+            y = fn(x, hist, w32, b32, stream)
+            hist_out = torch.cat([hist[:, 1:, :], x.unsqueeze(1)], dim=1)
+    pool[indices] = hist_out
+    return y
 
 
 def conv_stream():

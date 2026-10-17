@@ -475,14 +475,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     self._conv_zero_bias = _b32
             else:
                 _b32 = layer.bias
-            _kk = _w32.shape[0]
-            _slots = cache_indices
-            _hist_bf = conv_states[_slots]
-            _y, _hout = _fop(mixed_qkv, _hist_bf, _w32, _b32, _pair[1]())
-            # The op returns the rolled window, so the caller only does the
-            # indexed pool write instead of 3 slices + stack + cast.
-            conv_states[_slots] = _hout
-            mixed_qkv = _y
+            # One device kernel: it reads the history straight out of the pool
+            # and writes the rolled window back in place, so there is no gather
+            # and no scatter in the caller any more.
+            mixed_qkv = _fop(
+                mixed_qkv, conv_states, cache_indices, _w32, _b32, _pair[1]()
+            )
         elif _native_conv:
             if getattr(self, "_fused_conv_note", 0) == 0:
                 self._fused_conv_note = 1
