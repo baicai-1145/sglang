@@ -406,9 +406,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         _fop = None
         if _native_conv:
             try:
-                from .silu_conv_op import conv_stream, get_op
+                from .silu_conv_op import conv_stream, fused_conv, is_available
 
-                _fop = get_op()
+                _fop = fused_conv if is_available() else None
             except Exception:
                 _fop = None
         if (
@@ -447,11 +447,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             _kk = _w32.shape[0]
             _slots = cache_indices
             _hist_bf = conv_states[_slots]
-            _y = _fop(mixed_qkv, _hist_bf, _w32, _b32, conv_stream())
-            conv_states[_slots] = torch.stack(
-                [_hist_bf[:, jj, :] for jj in range(1, _kk - 1)] + [mixed_qkv],
-                dim=1,
-            ).to(conv_states.dtype)
+            _y, _hout = _fop(mixed_qkv, _hist_bf, _w32, _b32, conv_stream())
+            # The op returns the rolled window, so the caller only does the
+            # indexed pool write instead of 3 slices + stack + cast.
+            conv_states[_slots] = _hout
             mixed_qkv = _y
         elif _native_conv:
             if getattr(self, "_fused_conv_note", 0) == 0:
