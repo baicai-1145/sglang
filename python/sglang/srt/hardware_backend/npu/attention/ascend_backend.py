@@ -2752,9 +2752,7 @@ class AscendAttnBackend(AttentionBackend):
         # graph cannot freeze: row[pos] = (row * onehot_pos).sum(-1).
         _r2t = self.req_to_token_pool.req_to_token
         _row = _r2t.index_select(0, base.reshape(-1).clamp(max=tbl_w - 1))  # [bs, tbl_w]
-        _pos = (base * 0 + kv_idx).clamp(max=tbl_w - 1)  # [bs, MAX_KV]
-        _onehot = torch.nn.functional.one_hot(_pos, tbl_w).to(_row.dtype)  # [bs,MAX_KV,tbl_w]
-        tokens = (_row.unsqueeze(1) * _onehot).sum(-1).clamp(min=0)  # [bs, MAX_KV]
+        tokens = _row.gather(1, kv_idx.to(torch.int64).clamp(max=tbl_w - 1)).clamp(min=0)  # [bs, MAX_KV]
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, Hk, D
