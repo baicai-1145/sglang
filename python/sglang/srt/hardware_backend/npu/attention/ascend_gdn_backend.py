@@ -362,6 +362,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        try:
+            from .opcount import maybe_count
+
+            maybe_count(self)
+        except Exception:
+            pass
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
