@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+import os
+
 import torch
 
 from sglang.srt.environ import envs
@@ -51,6 +53,21 @@ def _is_ascend_950() -> bool:
 _ASCEND_950_CACHE: Optional[bool] = None
 
 
+def _fused_gmm1_opt_in() -> bool:
+    """Opt into the fused gmm1 (GroupedMatmulSwigluQuant) on Ascend 950.
+
+    Off by default: the operator is numerically fine but the path crashes the
+    server at request 11 (`ACL stream synchronize failed`, 507011) and changes
+    the sampling trajectory (CER 9.0% vs 0.4% over the same 10 sentences).
+    """
+    return os.environ.get("SGLANG_NPU_ENABLE_MXFP8_FUSED_GMM1", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
     # The fused gmm1 kernel (npu_grouped_matmul_swiglu_quant_v2) applies plain
@@ -62,11 +79,28 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if isinstance(kernel, NPUMXFP8MoEMethod):
-        # Ascend 950 (CANN 9.1, arch 3510): aclnnGroupedMatmulSwigluQuantV2
-        # fails its outputScale dim assert, so MXFP8 must run gmm1 unfused
-        # (plain grouped matmul + standard SwiGLU activation).
+        # Ascend 950 / CANN 9.1: the fused gmm1 (aclnnGroupedMatmulSwigluQuantV2,
+        # WeightNz entry) DOES work once the MX contract is met: 4-D weightScale
+        # (E, ceil(K/64), N, 2), 3-D xScale (M, ceil(K/64), 2), e8m0
+        # *_scale_dtype, dequant/quant mode 2, FRACTAL_NZ weight. Verified on
+        # 950PR: y_scale comes back as (M, ceil((N/2)/64), 2) e8m0 and matches
+        # an fp32 dequantised reference at cos=0.9994 (residual = plain e4m3
+        # rounding, rel_med 0.9% on the real w13 shape).
+        # The earlier "outputScale dim assert" was a caller-side shape error
+        # (2-D xScale / 3-D weightScale, no *_scale_dtype), not a CANN bug.
+        #
+        # NOT production-safe on 950 (2026-10-18), so it stays opt-in:
+        #   * 30-sentence run dies with `ACL stream synchronize failed`
+        #     (error 507011) on the 11th request, i.e. it crashes the server;
+        #   * 10-sentence CER 9.0% vs 0.4% for the unfused path (the fused
+        #     path pushes the model into a different sampling trajectory and
+        #     one utterance runs to the 1900-token cap).
+        # Numerically the operator is fine (cos 0.9994 vs fp32 dequant), so it
+        # remains available for experiments via the enable switch.
         if envs.SGLANG_NPU_DISABLE_MXFP8_FUSED_GMM1.get():
             return False
+        if _fused_gmm1_opt_in():
+            return True
         return False if _is_ascend_950() else True
     if has_clamp:
         return False  # W4A8MXFP4: fall back to unfused to preserve the clamp

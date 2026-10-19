@@ -89,6 +89,15 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
 
     def __init__(self, quant_mode: int = -1):
         self.quant_mode = quant_mode
+        self._static_row_idx: dict[Tuple[int, torch.device], torch.Tensor] = {}
+
+    def _get_static_row_idx(self, top_k: int, device: torch.device) -> torch.Tensor:
+        key = (top_k, device)
+        r = self._static_row_idx.get(key)
+        if r is None:
+            r = torch.arange(top_k, dtype=torch.int32, device=device)
+            self._static_row_idx[key] = r
+        return r
 
     def _init_routing(
         self,
@@ -98,6 +107,14 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
+        if num_tokens == 1 and self.quant_mode == -1:
+            h_perm = hidden_states.expand(top_k, -1).contiguous()
+            expanded_row_idx = self._get_static_row_idx(top_k, hidden_states.device)
+            expert_tokens = torch.zeros(
+                num_experts, dtype=torch.int64, device=hidden_states.device
+            ).scatter_(0, topk_ids[0].to(torch.int64), 1)
+            return h_perm, expanded_row_idx, expert_tokens, None
+
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,

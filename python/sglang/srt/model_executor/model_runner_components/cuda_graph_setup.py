@@ -410,6 +410,11 @@ def capture_cuda_graphs(
     )
     if capture_decode_cuda_graph:
         if current_platform.capabilities.graph_capture:
+            prepare_model_resources = getattr(
+                model_runner.model, "prepare_before_cuda_graph_capture", None
+            )
+            if prepare_model_resources is not None:
+                prepare_model_resources(model_runner)
             decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(
@@ -446,7 +451,7 @@ def capture_cuda_graphs(
                     kv_pool.get_key_buffer(aid).zero_()
                     kv_pool.get_value_buffer(aid).zero_()
                 except Exception:
-                    break
+                    continue
             # Mamba/GDN pools: the runtime tensors are reached via
             # req_to_token_pool.mamba2_layer_cache(layer_id) -> .conv[0] /
             # .temporal (the exact objects the GDN decode path reads).
@@ -454,14 +459,14 @@ def capture_cuda_graphs(
             m2 = getattr(req_pool, "mamba2_layer_cache", None)
             if callable(m2):
                 zeroed = 0
-                lid = 0
-                while True:
+                max_lid = getattr(getattr(model_runner, "model_config", None), "num_hidden_layers", 64)
+                for lid in range(max_lid):
                     try:
                         lc = m2(lid)
                     except Exception:
-                        break
+                        continue
                     if lc is None:
-                        break
+                        continue
                     ts = [getattr(lc, "temporal", None)] + list(
                         getattr(lc, "conv", None) or []
                     )
@@ -469,11 +474,15 @@ def capture_cuda_graphs(
                         if isinstance(t, torch.Tensor) and t.numel():
                             t.zero_()
                             zeroed += 1
-                    lid += 1
                 logger.info(
                     f"Post-capture reset zeroed {zeroed} mamba tensors "
-                    f"across {lid} layers"
+                    f"across {max_lid} scanned layers"
                 )
+            for b in getattr(model_runner, "decode_attn_backend_group", []) or []:
+                if hasattr(b, "_captured_sdpa_meta"):
+                    b._captured_sdpa_meta = None
+            if hasattr(model_runner.attn_backend, "_captured_sdpa_meta"):
+                model_runner.attn_backend._captured_sdpa_meta = None
             logger.info(
                 "Post-capture pool reset done (req_to_token + KV + mamba zeroed)"
             )

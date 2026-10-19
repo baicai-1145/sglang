@@ -31,6 +31,23 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
 )
+
+
+def qwen3_5_gdn_decode_views(
+    mixed_qkvz,
+    mixed_ba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    tokens = mixed_qkvz.shape[0]
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = mixed_qkvz[:, :qkv_dim].contiguous()
+    z = mixed_qkvz[:, qkv_dim:].view(tokens, num_heads_v, head_v).contiguous()
+    b = mixed_ba[:, :num_heads_v].contiguous()
+    a = mixed_ba[:, num_heads_v : 2 * num_heads_v].contiguous()
+    return mixed_qkv, z, b, a
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 # Configs
@@ -185,6 +202,14 @@ _gdn_decode_fused_proj_conv = (
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+
+_DRAMA3_LAYERTRACE = bool(os.environ.get("DRAMA3_LAYERTRACE"))
+_DRAMA3_DEBUG_FRAMES = bool(os.environ.get("DRAMA3_DEBUG_FRAMES"))
+_DRAMA3_DUMP_PROJ = bool(os.environ.get("DRAMA3_DUMP_PROJ"))
+_DRAMA3_GATED_NORM_TORCH = bool(os.environ.get("DRAMA3_GATED_NORM_TORCH"))
+_DRAMA3_QKVZBA_TORCH = bool(os.environ.get("DRAMA3_QKVZBA_TORCH"))
+_DRAMA3_DUMP_RESID = bool(os.environ.get("DRAMA3_DUMP_RESID"))
+_DRAMA3_SPLITQKV_TORCH = bool(os.environ.get("DRAMA3_SPLITQKV_TORCH"))
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -365,9 +390,7 @@ def _trace_layer_out(module, out, kind):
     no host sync, safe under NPUGraph capture and replay. Read out-of-graph
     via DRAMA3_LAYERTRACE.
     """
-    import os as _otl
-
-    if not _otl.environ.get("DRAMA3_LAYERTRACE"):
+    if not _DRAMA3_LAYERTRACE:
         return
     tl = getattr(module, "_lt_buf", None)
     if tl is None:
@@ -732,7 +755,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         BF16 parameters alias the packed rows. FP8 keeps the original layouts
         for the separate path and publishes its derived-cache update constraint.
         """
-        if not (_is_cuda or _use_aiter) or self._fused_in_proj_weight is not None:
+        if not (_is_cuda or _use_aiter or _is_npu) or self._fused_in_proj_weight is not None:
             return
         if (
             _use_aiter
@@ -901,8 +924,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 hidden_states, self._fused_in_proj_weight, None
             )
             return (
-                fused_out[:, : self._fused_in_proj_qkvz_width],
-                fused_out[:, self._fused_in_proj_qkvz_width :],
+                fused_out[:, : self._fused_in_proj_qkvz_width].contiguous(),
+                fused_out[:, self._fused_in_proj_qkvz_width :].contiguous(),
             )
 
         if (
@@ -939,8 +962,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
-        import os as _opj
-        if _opj.environ.get("DRAMA3_DUMP_PROJ"):
+        if _DRAMA3_DUMP_PROJ:
             _q = projected_states_qkvz[0].float()
             print(f"[proj] L{getattr(self, 'layer_id', '?')} qkvz_out norm={float(_q.norm()):.2f} "
                   f"absmax={float(_q.abs().max()):.3f} w_norm={float(self.in_proj_qkvz.weight.float().norm()):.1f}",
@@ -1007,9 +1029,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        import os as _ozg
-
-        if _ozg.environ.get("DRAMA3_GATED_NORM_TORCH"):
+        if _DRAMA3_GATED_NORM_TORCH:
             # graph-bisect: 纯 torch gated RMSNorm (z-gate on output side)
             import torch as _tzg
 
@@ -1100,9 +1120,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             use_strided_prefill_z = (
                 _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
             )
+            use_direct_views = (
+                use_strided_prefill_z
+                or (_is_npu and not os.environ.get("DRAMA3_DISABLE_DIRECT_VIEWS"))
+            )
             split_fn = (
-                qwen3_5_gdn_prefill_projection_views
-                if use_strided_prefill_z
+                qwen3_5_gdn_decode_views
+                if use_direct_views
                 else fused_qkvzba_split_reshape_cat_contiguous
             )
             mixed_qkv, z, b, a = split_fn(
@@ -1125,9 +1149,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        import os as _os
-
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE"):
+        if _DRAMA3_DEBUG_FRAMES:
             print(
                 f"[drama3] L{getattr(self, 'layer_id', '?')} in_proj: "
                 f"qkvz_nan={bool(projected_states_qkvz.isnan().any())} "
@@ -1182,9 +1204,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
-        import os as _ozg
-
-        if _ozg.environ.get("DRAMA3_GATED_NORM_TORCH"):
+        if _DRAMA3_GATED_NORM_TORCH:
             # graph-bisect: 纯 torch gated RMSNorm (z-gate on output side)
             import torch as _tzg
 
@@ -1251,7 +1271,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=(
                     alt_stream
-                    if (_is_cuda or _disable_shared_experts_fusion())
+                    if (_is_cuda or _is_npu or _disable_shared_experts_fusion())
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
@@ -1275,6 +1295,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm.is_input_norm = True
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1312,8 +1333,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        import os as _ors
-        if _ors.environ.get("DRAMA3_DUMP_RESID") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        if _DRAMA3_DUMP_RESID and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             _h0 = hs[0].float()
             print(f"[resid] L{getattr(self, 'layer_id', '?')}-lin IN  norm={float(_h0.norm()):.2f} absmax={float(_h0.abs().max()):.3f}", flush=True)
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
@@ -1323,9 +1343,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        import os as _os
-
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
+        if _DRAMA3_DEBUG_FRAMES and not isinstance(
             hidden_states, tuple
         ):
             print(
@@ -1346,7 +1364,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
+        if _DRAMA3_DEBUG_FRAMES and not isinstance(
             hidden_states, tuple
         ):
             _r0 = hidden_states[0].float()
@@ -1483,7 +1501,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=(
                     alt_stream
-                    if (_is_cuda or _disable_shared_experts_fusion())
+                    if (_is_cuda or _is_npu or _disable_shared_experts_fusion())
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
@@ -1496,6 +1514,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm.is_input_norm = True
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1644,26 +1663,33 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # GRAPH FIX (950PR): the old path refreshed rotary_emb.position_cos/
-        # position_sin ONLY at the first full-attn layer via an eager Python
-        # call; under NPU graph capture that branch is frozen, so every replay
-        # reused the capture-time positions' cos/sin — all full-attention
-        # layers decoded with wrong rotary embedding from step 1 (first-token
-        # logit divergence vs eager). Build cos/sin IN-GRAPH with a dynamic
-        # index_select on the fixed cos_sin_cache (capture-safe, verified).
-        cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions)
-        last_dim = cos_sin.size(-1)
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2)
-            .repeat(1, 1, 2)
-            .chunk(2, dim=-2)
-        )
-        position_sin = sin.reshape(-1, 1, 1, last_dim)
-        position_cos = cos.reshape(-1, 1, 1, last_dim)
+        # GRAPH FIX (950PR): Build cos/sin IN-GRAPH with a dynamic index_select on
+        # the fixed cos_sin_cache. Cache on forward_batch so all 10 full-attention
+        # layers share a single computation per step, eliminating 9 redundant
+        # index_select + repeat + chunk launches (~176 us/step savings, bit-exact).
+        cached_pos_id = getattr(forward_batch, "_cached_pos_id", None)
+        if cached_pos_id == id(positions):
+            position_cos = forward_batch._cached_pos_cos
+            position_sin = forward_batch._cached_pos_sin
+        else:
+            if not hasattr(self.rotary_emb, "_cached_full_cos"):
+                raw_cache = self.rotary_emb.cos_sin_cache
+                ld = raw_cache.size(-1)
+                c_full, s_full = (
+                    raw_cache.reshape(-1, 2, ld // 2)
+                    .repeat(1, 1, 2)
+                    .chunk(2, dim=-2)
+                )
+                self.rotary_emb._cached_full_cos = c_full.reshape(-1, 1, 1, ld).contiguous()
+                self.rotary_emb._cached_full_sin = s_full.reshape(-1, 1, 1, ld).contiguous()
+            position_cos = self.rotary_emb._cached_full_cos.index_select(0, positions)
+            position_sin = self.rotary_emb._cached_full_sin.index_select(0, positions)
+            if forward_batch is not None:
+                forward_batch._cached_pos_id = id(positions)
+                forward_batch._cached_pos_cos = position_cos
+                forward_batch._cached_pos_sin = position_sin
 
-        import os as _osq
-
-        if _osq.environ.get("DRAMA3_SPLITQKV_TORCH"):
+        if _DRAMA3_SPLITQKV_TORCH:
             # graph-bisect: 纯 torch 拆包+qk-norm+rope+gate.
             # 语义: q,k 各自 Gemma-RMSNorm (zero-centered gamma: (w+1)),
             # partial rotary (前 rope_dim 转, 其余直通), gate 原样.
@@ -1784,7 +1810,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                attn_output = attn_output * torch.sigmoid(gate_val)
+                attn_output = attn_output * gate_val.sigmoid_()
 
         output, _ = self.o_proj(attn_output)
         _trace_layer_out(self, output, "attn")
@@ -1806,8 +1832,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        import os as _orsa
-        if _orsa.environ.get("DRAMA3_DUMP_RESID") and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        if _DRAMA3_DUMP_RESID and not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             _h0 = hs[0].float()
             print(f"[resid] L{self.layer_id}-attn IN  norm={float(_h0.norm()):.2f} absmax={float(_h0.abs().max()):.3f}", flush=True)
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
@@ -1818,9 +1843,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        import os as _os
-
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
+        if _DRAMA3_DEBUG_FRAMES and not isinstance(
             hidden_states, tuple
         ):
             print(
@@ -1829,8 +1852,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 f"absmax={float(hidden_states.abs().max()):.3f}",
                 flush=True,
             )
-        import os as _osr2
-        if _osr2.environ.get("DRAMA3_DUMP_RESID") and not isinstance(hidden_states, tuple) and hidden_states.shape[0] > 0:
+        if _DRAMA3_DUMP_RESID and not isinstance(hidden_states, tuple) and hidden_states.shape[0] > 0:
             _r1 = hidden_states[0].float()
             print(f"[resid] L{self.layer_id}-attn POSTATTN norm={float(_r1.norm()):.2f}", flush=True)
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1844,7 +1866,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        if _os.environ.get("DRAMA3_DEBUG_FRAMES") and not _os.environ.get("DRAMA3_IN_CAPTURE") and not isinstance(
+        if _DRAMA3_DEBUG_FRAMES and not isinstance(
             hidden_states, tuple
         ):
             print(
@@ -1959,7 +1981,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
 
-        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
+        alt_stream = (
+            get_stream("alt")
+            if _is_cuda or _is_npu or _hip_use_alt_stream
+            else None
+        )
 
         # Embedding layer
         self.embed_tokens = self._build_embed_tokens(config)
@@ -2050,7 +2076,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+        import os as _ospk
+        enable_packed = (
+            (_use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES)
+            or (_is_npu and _ospk.environ.get("SGLANG_NPU_PACKED_IN_PROJ", "1") == "1")
+        )
+        if enable_packed:
             packed = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):

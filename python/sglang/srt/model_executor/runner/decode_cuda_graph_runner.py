@@ -1630,18 +1630,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # Rebind IFA host-side KV lengths captured as python lists
                 # (see NPUCudaGraphBackend.replay); one dict broadcasts to
                 # every recorded IFA call via update_capture_record.
-                sl = forward_batch.seq_lens
-                if sl is not None:
-                    sl_list = sl.detach().cpu().int().tolist()
-                    cumsum = []
-                    acc = 0
-                    for x in sl_list:
-                        acc += x
-                        cumsum.append(acc)
-                    replay_kwargs["graph_input_update"] = {
-                        "actual_seq_lengths": cumsum,
-                        "actual_seq_lengths_kv": sl_list,
-                    }
+                if getattr(self.model_runner, "uses_ifa", False):
+                    sl = forward_batch.seq_lens
+                    if sl is not None:
+                        sl_list = sl.detach().cpu().int().tolist()
+                        cumsum = []
+                        acc = 0
+                        for x in sl_list:
+                            acc += x
+                            cumsum.append(acc)
+                        replay_kwargs["graph_input_update"] = {
+                            "actual_seq_lengths": cumsum,
+                            "actual_seq_lengths_kv": sl_list,
+                        }
             output = self.backend.replay(
                 self._replay_graph_key, forward_batch, **replay_kwargs
             )

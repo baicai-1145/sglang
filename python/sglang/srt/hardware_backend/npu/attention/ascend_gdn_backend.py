@@ -410,29 +410,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         assert isinstance(mixed_qkv, torch.Tensor)
 
-        import os as _os
-
-        if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
-            cs = conv_states[cache_indices]
-            bad = int((~torch.isfinite(cs)).sum())
-            if bad:
-                print(
-                    f"[drama3] conv-in L{layer.layer_id}: slot={cache_indices.tolist()} "
-                    f"nonfinite={bad}/{cs.numel()} "
-                    f"absmax={float(cs[torch.isfinite(cs)].abs().max()) if (cs==cs).any() else -1:.1f} "
-                    f"x_max={float(mixed_qkv.abs().max()):.1f}",
-                    flush=True,
-                )
-
-        # Ascend 950 (CANN 9.1): the aclnn causal_conv1d AICPU path
-        # intermittently emits NaN on run_mode=1 single-token decode with
-        # fully-finite inputs (GetAscendCoreSyncAddr ret 207000 precedes it),
-        # corrupting conv_states and the recurrent state. Replace the fused
-        # op with an exact PyTorch computation: for a single decode token the
-        # causal conv is just a dot of the last (kernel_size) inputs with the
-        # weight taps, then SiLU (activation_mode=1).
-        import os as _os
-
         _native_conv = _ENV_NATIVE_CONV and not (
             getattr(self, "graph_mode", False)
             and _ENV_GRAPH_CONV_ACLNN
@@ -593,9 +570,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
 
-        import os as _os
-
-        if _ENV_DUMP_GDNSTEP and not _os.environ.get("DRAMA3_IN_CAPTURE") and int(layer.layer_id) == 0:
+        if _ENV_DUMP_GDNSTEP and int(layer.layer_id) == 0:
             # GDN decode 数值取证: 首个 GDN 层 (L0), 前 40 步, dump kernel 全输入+输出+状态
             _st = int(getattr(self, "_gdn_dump_step", 0))
             if _st < 40:
@@ -616,18 +591,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 if _st == 0:
                     print(f"[gdn-dump] L0 step0 saved q{tuple(query.shape)} k{tuple(key.shape)} v{tuple(value.shape)} a{tuple(a.shape)}", flush=True)
                 self._gdn_dump_step = _st + 1
-
-        if _ENV_DEBUG_FRAMES and not _os.environ.get("DRAMA3_IN_CAPTURE"):
-            print(
-                f"[drama3] decode L{layer.layer_id}: q_nan={bool(query.isnan().any())} "
-                f"v_nan={bool(value.isnan().any())} a_nan={bool(a.isnan().any())} "
-                f"b_nan={bool(b.isnan().any())} "
-                f"cidx={cache_indices.tolist()} "
-                f"st_nan={bool(ssm_states[cache_indices].isnan().any())} "
-                f"out_nan={bool(core_attn_out.isnan().any())} "
-                f"out_max={float(core_attn_out.abs().max()):.2f}",
-                flush=True,
-            )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
@@ -949,6 +912,30 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         k = l2norm_fwd(k)  # [T, Nk, Dk]
         g = g.to(torch.float32)  # [T, Nv]
         scale = k.shape[-1] ** -0.5
+
+        # Try high-performance PTO-ISA MegaGDN kernel for prefill
+        try:
+            import os as _opto
+            if _opto.environ.get("DRAMA3_ENABLE_MEGAGDN_PTO", "1") == "1":
+                if (cu_seqlens is None or cu_seqlens.numel() <= 2) and q.shape[-1] == 128:
+                    from megagdn_pto.mega_kernel import run_mega_kernel
+                    _T, _Nk, _D = q.shape
+                    _Nv = v.shape[1]
+                    if _Nk == 16 and _Nv == 32:
+                        _cu32 = cu_seqlens.to(torch.int32) if cu_seqlens is not None else torch.tensor([0, _T], dtype=torch.int32, device=q.device)
+                        _has_init = bool(has_initial_states[0]) if has_initial_states is not None and len(has_initial_states) > 0 else (initial_state is not None)
+                        _h0 = initial_state[0:1].half() if (_has_init and initial_state is not None) else None
+                        _out_pto, _fs_pto = run_mega_kernel(
+                            q.unsqueeze(0).half(), k.unsqueeze(0).half(), v.unsqueeze(0).half(),
+                            g.unsqueeze(0).float(), beta.unsqueeze(0).half(), _cu32,
+                            chunk_size=128, scale=scale, initial_state=_h0, return_final_state=True
+                        )
+                        if torch.isfinite(_out_pto).all() and torch.isfinite(_fs_pto).all():
+                            _cout = _out_pto[0].to(q.dtype)
+                            _sout = _fs_pto.view(1, _Nv, _D, _D).to(q.dtype)
+                            return _cout, _sout, None
+        except Exception:
+            pass
 
         # Ascend 950: the aclnn ChunkGatedDeltaRule binary is missing and
         # the sgl-kernel-npu triton chunk port diverges on head-repeated

@@ -67,6 +67,9 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+
+_DRAMA3_KV_SINGLE_STREAM = bool(os.environ.get("DRAMA3_KV_SINGLE_STREAM"))
+_DRAMA3_KV_WRITE_TRACE = bool(os.environ.get("DRAMA3_KV_WRITE_TRACE"))
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
@@ -204,9 +207,8 @@ def _set_kv_buffer_impl(
         )
 
     from sglang.srt.model_executor.runner import get_is_capture_mode
-    import os as _okv
 
-    if _okv.environ.get("DRAMA3_KV_WRITE_TRACE"):
+    if _DRAMA3_KV_WRITE_TRACE:
         _vw = globals().get("_KVW_W8", None)
         if _vw is None or _vw.device != v.device:
             import torch as _tkv
@@ -247,7 +249,7 @@ def _set_kv_buffer_impl(
     if (
         get_is_capture_mode()
         and alt_stream is not None
-        and not _okv.environ.get("DRAMA3_KV_SINGLE_STREAM")
+        and not _DRAMA3_KV_SINGLE_STREAM
     ):
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)

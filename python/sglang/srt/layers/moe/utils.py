@@ -398,6 +398,9 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
     """
     Automatically choose the dispatch output dtype for Ascend.
     """
+    import os as _os
+    if _os.environ.get("SGLANG_NPU_MOE_ROUTING_FUSED_QUANT") == "1":
+        return DispatcherOutputDtype.MXFP8
 
     # 1. Parse quant config to determine the output dtype of dispatcher
     if dispatcher.quant_config is not None:

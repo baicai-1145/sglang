@@ -58,6 +58,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
+_USE_FUSED_ADD_RMS_NORM = os.environ.get("SGLANG_NPU_FUSED_ADD_RMS_NORM") == "1"
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -1114,6 +1115,7 @@ class GemmaRMSNorm(BaseFusedOp):
         # costs two extra kernels (cast + add) per norm layer, which is
         # measurable at decode time.
         self._fused_gamma_cache: Optional[torch.Tensor] = None
+        self._fused_gamma_bf16_cache: Optional[torch.Tensor] = None
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
@@ -1147,6 +1149,16 @@ class GemmaRMSNorm(BaseFusedOp):
         torch.add(param.data, 1.0, out=self.gemma_weight)
         # The fused NPU norm keeps its own fp32 copy of (1 + weight).
         self._fused_gamma_cache = None
+        self._fused_gamma_bf16_cache = None
+
+    def _fused_gamma_bf16(self) -> torch.Tensor:
+        gamma_bf16 = getattr(self, "_fused_gamma_bf16_cache", None)
+        src = self.weight
+        if gamma_bf16 is None or gamma_bf16.device != src.device:
+            with torch.no_grad():
+                gamma_bf16 = (src.detach().float() + 1.0).to(torch.bfloat16).contiguous()
+            self._fused_gamma_bf16_cache = gamma_bf16
+        return gamma_bf16
 
     def _forward_impl(
         self,
@@ -1275,16 +1287,22 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            # Bit-exact vs forward_native: same bf16 residual add, then one
-            # aclnn op doing fp32 normalize * fp32 gain in place of the
-            # 7-kernel torch decomposition. npu_add_rms_norm cannot be used
-            # here because it rejects an fp32 gain and its bf16 gain path is
-            # not bit-exact.
-            residual = residual + x
-            norm_out, _ = torch_npu.npu_rms_norm(
-                residual, gamma, self.variance_epsilon
+            use_fused_add = (
+                _USE_FUSED_ADD_RMS_NORM
+                and getattr(self, "is_input_norm", False)
             )
-            result = (norm_out, residual)
+            if use_fused_add:
+                gamma_bf16 = self._fused_gamma_bf16()
+                ret = torch_npu.npu_add_rms_norm(
+                    x, residual, gamma_bf16, epsilon=self.variance_epsilon
+                )
+                result = (ret[0], ret[2])
+            else:
+                residual = residual + x
+                norm_out, _ = torch_npu.npu_rms_norm(
+                    residual, gamma, self.variance_epsilon
+                )
+                result = (norm_out, residual)
         elif x.dim() != 2:
             original_shape = x.shape
             norm_out, _ = torch_npu.npu_rms_norm(

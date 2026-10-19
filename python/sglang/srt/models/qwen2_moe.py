@@ -19,6 +19,9 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
+
+_DRAMA3_MOE_SINGLE_STREAM = bool(os.environ.get("DRAMA3_MOE_SINGLE_STREAM"))
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -144,6 +147,20 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _device_current_stream():
+    if _is_npu:
+        import torch_npu
+        return torch_npu.npu.current_stream()
+    return torch.cuda.current_stream()
+
+
+def _device_stream_ctx(stream):
+    if _is_npu:
+        import torch_npu
+        return torch_npu.npu.stream(stream)
+    return torch.cuda.stream(stream)
 
 
 def get_num_shared_experts(config: PretrainedConfig) -> int:
@@ -556,16 +573,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 elif _is_npu:
                     gate = self.shared_expert_gate(hidden_states)
-                    # Resolved once: this used to attempt the import on every
-                    # layer of every frame. The module is absent in this
-                    # deployment, so each attempt raised and was caught, costing
-                    # a measured 14.7 us x 40 layers x 60 frames = 35 ms per
-                    # request of pure Python overhead.
-                    _fsm = _fused_sigmoid_mul_broadcast()
-                    if _fsm is not None:
-                        shared_output = _fsm(shared_output, gate)
-                    else:
-                        shared_output = F.sigmoid(gate) * shared_output
+                    shared_output = shared_output * gate.sigmoid_()
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))
@@ -781,7 +789,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
+        current_stream = _device_current_stream()
 
         if defer_finalize:
             # Keep routed FC2 on the current stream as finalize's PDL dependency;
@@ -790,7 +798,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_output = self._forward_router_experts(
                 hidden_states, defer_finalize=True
             )
-            with torch.cuda.stream(self.alt_stream):
+            with _device_stream_ctx(self.alt_stream):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
                 )
@@ -826,7 +834,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        with _device_stream_ctx(self.alt_stream):
             router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
@@ -875,7 +883,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and get_is_capture_mode()
             and not torch.compiler.is_compiling()
-            and not __import__("os").environ.get("DRAMA3_MOE_SINGLE_STREAM")
+            and not _DRAMA3_MOE_SINGLE_STREAM
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,
