@@ -970,19 +970,29 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                             _h0 = None
                         _v_pad = torch.nn.functional.pad(
                             v.unsqueeze(0).to(torch.float16), (0, 128 - _V)
+                        ).contiguous() if _V < 128 else v.unsqueeze(0).to(
+                            torch.float16
                         ).contiguous()
-                        _out_pto, _fs_pto = run_mega_kernel(
-                            q.unsqueeze(0).to(torch.float16),
-                            k.unsqueeze(0).to(torch.float16),
-                            _v_pad,
-                            g.unsqueeze(0).float(),
-                            beta.unsqueeze(0).to(torch.float16),
-                            _cu32,
-                            chunk_size=128,
-                            scale=scale,
-                            initial_state=_h0,
-                            return_final_state=True,
-                        )
+                        _cur = torch.npu.current_stream()
+                        _ps = getattr(self, "_pto_stream", None)
+                        if _ps is None:
+                            _ps = torch.npu.Stream()
+                            self._pto_stream = _ps
+                        _ps.wait_stream(_cur)
+                        with torch.npu.stream(_ps):
+                            _out_pto, _fs_pto = run_mega_kernel(
+                                q.unsqueeze(0).to(torch.float16),
+                                k.unsqueeze(0).to(torch.float16),
+                                _v_pad,
+                                g.unsqueeze(0).float(),
+                                beta.unsqueeze(0).to(torch.float16),
+                                _cu32,
+                                chunk_size=128,
+                                scale=scale,
+                                initial_state=_h0,
+                                return_final_state=True,
+                            )
+                        _cur.wait_stream(_ps)
                         _hit = getattr(self, "_pto_hits", 0) + 1
                         self._pto_hits = _hit
                         if _hit == 1:
