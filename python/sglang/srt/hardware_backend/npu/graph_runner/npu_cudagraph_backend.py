@@ -134,7 +134,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                     graph,
                     pool=self._pool,
                     stream=self._capture_stream,
-                    auto_dispatch_capture=True,
+                    auto_dispatch_capture=bool(int(__import__("os").environ.get("SGLANG_NPU_AUTO_DISPATCH", "1"))),
                 ),
             ):
                 out = forward_fn()

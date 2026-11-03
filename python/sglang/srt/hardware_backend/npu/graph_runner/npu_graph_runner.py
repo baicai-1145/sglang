@@ -180,7 +180,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 graph,
                 pool=pool,
                 stream=stream,
-                auto_dispatch_capture=True,
+                auto_dispatch_capture=bool(int(__import__("os").environ.get("SGLANG_NPU_AUTO_DISPATCH", "1"))),
             ),
         ):
             out = run_once_fn()
