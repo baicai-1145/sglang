@@ -103,15 +103,26 @@ def _kv_gather_hm_fn():
             verbose=False,
         )
         _KV_GATHER_HM_FN = mod.kv_gather_hm
-        # Eager warmup: aclnn's first call lazily loads the operator binary
-        # (dlopen + workspace alloc). Doing that inside NPUGraph capture is
-        # unreliable, so run a tiny dummy call right here, at load time.
-        _w_pool = torch.zeros(1024, 2, 128, dtype=torch.bfloat16, device="npu")
-        _w_idx = torch.zeros(1, 8, dtype=torch.int64, device="npu")
-        _w_y = mod.kv_gather_hm(_w_pool, _w_idx,
-                                int(torch.npu.current_stream().npu_stream))
-        torch.npu.synchronize()
-        print("[kvgather] KvGatherHM head-major gather loaded+warm", flush=True)
+        # Eager warmup across EVERY production shape: aclnn's first call per
+        # shape runs the full tiling/executor path through a process-static
+        # executor space that is NOT thread-safe. The decode capture thread
+        # races other engine threads exactly when a NEW shape first hits the
+        # op inside capture (nondeterministic vector-core faults, drifting op
+        # attribution). Pre-touching all shapes here (single-threaded load
+        # time) makes every capture-time call hit the cached fast path.
+        _w_stream = int(torch.npu.current_stream().npu_stream)
+        with torch.no_grad():
+            for _wd in (128, 256):
+                _w_pool = torch.zeros(
+                    1024, 2, _wd, dtype=torch.bfloat16, device="npu"
+                )
+                for _wb in (1, 2, 4, 8, 12, 16, 24):
+                    _w_idx = torch.zeros(
+                        _wb, 2048, dtype=torch.int64, device="npu"
+                    )
+                    mod.kv_gather_hm(_w_pool, _w_idx, _w_stream)
+            torch.npu.synchronize()
+        print("[kvgather] KvGatherHM loaded+warm(all buckets)", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"[kvgather] load failed, keeping torch gather: {e}", flush=True)
         _KV_GATHER_HM_FN = None
