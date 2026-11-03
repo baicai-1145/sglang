@@ -924,8 +924,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         try:
             import os as _opto
             if _opto.environ.get("DRAMA3_ENABLE_MEGAGDN_PTO", "1") == "1":
-                if not getattr(self, "_pto_probe", False):
-                    self._pto_probe = True
+                _pc = getattr(self, "_pto_calls", 0) + 1
+                self._pto_calls = _pc
+                if _pc <= 8:
+                    print(f"[megagdn] call#{_pc}: T={q.shape[0]} Nk={q.shape[1]} "
+                          f"v={tuple(v.shape)} cu={None if cu_seqlens is None else int(cu_seqlens.numel())-1}",
+                          flush=True)
                     _fa = _fl = 0
                     try:
                         import ctypes as _ct
@@ -943,7 +947,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                         f"fftsAddr=0x{_fa:x} fftsLen={_fl}",
                         flush=True,
                     )
-                if q.shape[-1] == 128 and q.shape[0] >= 64:
+                if q.shape[-1] == 128 and q.shape[0] >= 128:
                     from megagdn_pto.mega_kernel import run_mega_kernel
                     _T, _Nk, _D = q.shape
                     _Nv = v.shape[-2]
@@ -995,8 +999,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                         _cur.wait_stream(_ps)
                         _hit = getattr(self, "_pto_hits", 0) + 1
                         self._pto_hits = _hit
-                        if _hit == 1:
-                            print(f"[megagdn] PTO HIT cu_n={_cu32.numel()-1} T={_T}", flush=True)
+                        if _hit <= 5:
+                            print(f"[megagdn] PTO HIT #{_hit} cu_n={_cu32.numel()-1} T={_T}", flush=True)
                         if (
                             torch.isfinite(_out_pto).all()
                             and torch.isfinite(_fs_pto).all()
