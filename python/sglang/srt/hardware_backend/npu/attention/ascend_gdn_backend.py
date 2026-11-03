@@ -924,21 +924,31 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         try:
             import os as _opto
             if _opto.environ.get("DRAMA3_ENABLE_MEGAGDN_PTO", "1") == "1":
-                if not getattr(chunk_gdn, "_pto_probe", False):
-                    chunk_gdn._pto_probe = True
+                if not getattr(self, "_pto_probe", False):
+                    self._pto_probe = True
+                    _fa = _fl = 0
+                    try:
+                        import ctypes as _ct
+                        _rt = _ct.CDLL("libruntime.so")
+                        _a = _ct.c_uint64(0)
+                        _l = _ct.c_uint32(0)
+                        _rc = _rt.rtGetC2cCtrlAddr(_ct.byref(_a), _ct.byref(_l))
+                        _fa, _fl = _a.value, _l.value
+                    except Exception:
+                        pass
                     print(
                         f"[megagdn] probe: q{tuple(q.shape)} v{tuple(v.shape)} "
                         f"cu={None if cu_seqlens is None else tuple(cu_seqlens.shape)} "
-                        f"has_init={None if has_initial_states is None else tuple(has_initial_states.shape)} "
-                        f"init_state={None if initial_state is None else tuple(initial_state.shape)}",
+                        f"init_state={None if initial_state is None else tuple(initial_state.shape)} "
+                        f"fftsAddr=0x{_fa:x} fftsLen={_fl}",
                         flush=True,
                     )
-                if q.shape[-1] == 128 and v.shape[-1] < 128:
+                if q.shape[-1] == 128 and q.shape[0] >= 64:
                     from megagdn_pto.mega_kernel import run_mega_kernel
                     _T, _Nk, _D = q.shape
                     _Nv = v.shape[-2]
                     _V = v.shape[-1]
-                    if _Nk == 16 and _Nv == 32:
+                    if _Nk == 16 and _Nv == 32 and _D == 128 and _V == 128:
                         _cu32 = (
                             cu_seqlens.to(torch.int32)
                             if cu_seqlens is not None
@@ -973,8 +983,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                             initial_state=_h0,
                             return_final_state=True,
                         )
-                        _hit = getattr(chunk_gdn, "_pto_hits", 0) + 1
-                        chunk_gdn._pto_hits = _hit
+                        _hit = getattr(self, "_pto_hits", 0) + 1
+                        self._pto_hits = _hit
                         if _hit == 1:
                             print(f"[megagdn] PTO HIT cu_n={_cu32.numel()-1} T={_T}", flush=True)
                         if (
@@ -985,9 +995,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                             _sout = _fs_pto[..., :_V].to(q.dtype)
                             return _cout, _sout, None
         except Exception as _pto_exc:
-            _e1 = getattr(chunk_gdn, "_pto_err", 0)
+            _e1 = getattr(self, "_pto_err", 0)
             if _e1 < 2:
-                chunk_gdn._pto_err = _e1 + 1
+                self._pto_err = _e1 + 1
                 import traceback as _tb
                 print(f"[megagdn] PTO branch raised: {type(_pto_exc).__name__}: {_pto_exc}",
                       flush=True)
