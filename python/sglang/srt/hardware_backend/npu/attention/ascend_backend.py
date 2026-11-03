@@ -2880,28 +2880,8 @@ class AscendAttnBackend(AttentionBackend):
                       f"capturing={torch.npu.is_current_stream_capturing()}", flush=True)
             self._kv_gather_calls = _n + 1
             _stream = int(torch.npu.current_stream().npu_stream)
-            # pack [tokens | seq_len] -> [bs, MAX_KV+1]: trailing column rides
-            # the indices tensor into the kernel (valid-prefix gather, zero
-            # tail). The cat is a captured op (built on first layer, replayed
-            # per step); later layers share the static buffer.
-            _sl64 = getattr(forward_batch, "_kv_gather_sl64", None)
-            if _sl64 is None or _sl64.shape[0] != bs:
-                _sl64 = (
-                    seq_lens
-                    if seq_lens.dtype == torch.int64
-                    else seq_lens.to(torch.int64)
-                )
-                forward_batch._kv_gather_sl64 = _sl64
-            _pk = getattr(forward_batch, "_kv_gather_pk", None)
-            if (
-                _pk is None
-                or _pk.shape[0] != bs
-                or _pk.shape[1] != tokens.shape[1] + 1
-            ):
-                _pk = torch.cat([tokens, _sl64.view(-1, 1)], dim=1)
-                forward_batch._kv_gather_pk = _pk
-            k_bmm = _kv_gather(k_cache, _pk, _stream)  # [bs*Hk, MAX_KV, D]
-            v_bmm = _kv_gather(v_cache, _pk, _stream)  # [bs*Hv, MAX_KV, Dv]
+            k_bmm = _kv_gather(k_cache, tokens, _stream)  # [bs*Hk, MAX_KV, D]
+            v_bmm = _kv_gather(v_cache, tokens, _stream)  # [bs*Hv, MAX_KV, Dv]
             k_gathered = k_bmm  # dtype reference for _qr cast below
         else:
             if _kv_gather is not None and getattr(self, "_kv_gather_skip", 0) < 2:
