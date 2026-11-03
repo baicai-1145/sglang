@@ -66,6 +66,57 @@ _DRAMA3_ATTN_TRACE = bool(os.environ.get("DRAMA3_ATTN_TRACE"))
 _DRAMA3_KV_WRITE_TRACE = bool(os.environ.get("DRAMA3_KV_WRITE_TRACE"))
 _DRAMA3_DEBUG_ATTN_ZERO = bool(os.environ.get("DRAMA3_DEBUG_ATTN_ZERO"))
 
+# ---------------------------------------------------------------------------
+# KvGatherHM custom-op loader (head-major KV gather, see
+# custom-ops/KvGatherHM). Cached once per process; None = keep torch path.
+_KV_GATHER_HM_TRIED = False
+_KV_GATHER_HM_FN = None
+
+
+def _kv_gather_hm_fn():
+    """Return kv_gather_hm(pool[S,H,D], idx[B,T], stream) -> [B*H, T, D]."""
+    global _KV_GATHER_HM_TRIED, _KV_GATHER_HM_FN
+    if _KV_GATHER_HM_TRIED:
+        return _KV_GATHER_HM_FN
+    _KV_GATHER_HM_TRIED = True
+    if os.environ.get("SGLANG_NPU_DISABLE_KV_GATHER_HM"):
+        return None
+    try:
+        from torch.utils.cpp_extension import load
+
+        cann = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-9.1.0")
+        src = "/workspace/drama3-work/custom-ops/KvGatherHM/kv_gather_bind.cpp"
+        if not os.path.exists(src):
+            return None
+        mod = load(
+            name="kv_gather_hm_ext_c",
+            sources=[src],
+            extra_include_paths=[f"{cann}/include", f"{cann}/include/aclnn"],
+            extra_ldflags=[
+                f"-L{cann}/lib64",
+                "-lascendcl",
+                "-lnnopbase",
+                "-L/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib",
+                "-lcust_opapi",
+                "-Wl,--disable-new-dtags,-rpath,/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib",
+            ],
+            verbose=False,
+        )
+        _KV_GATHER_HM_FN = mod.kv_gather_hm
+        # Eager warmup: aclnn's first call lazily loads the operator binary
+        # (dlopen + workspace alloc). Doing that inside NPUGraph capture is
+        # unreliable, so run a tiny dummy call right here, at load time.
+        _w_pool = torch.zeros(1024, 2, 128, dtype=torch.bfloat16, device="npu")
+        _w_idx = torch.zeros(1, 8, dtype=torch.int64, device="npu")
+        _w_y = mod.kv_gather_hm(_w_pool, _w_idx,
+                                int(torch.npu.current_stream().npu_stream))
+        torch.npu.synchronize()
+        print("[kvgather] KvGatherHM head-major gather loaded+warm", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[kvgather] load failed, keeping torch gather: {e}", flush=True)
+        _KV_GATHER_HM_FN = None
+    return _KV_GATHER_HM_FN
+
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
@@ -2769,7 +2820,7 @@ class AscendAttnBackend(AttentionBackend):
             # graph cannot freeze: row[pos] = (row * onehot_pos).sum(-1).
             _r2t = self.req_to_token_pool.req_to_token
             _row = _r2t.index_select(0, base.reshape(-1).clamp(max=tbl_w - 1))  # [bs, tbl_w]
-            tokens = _row.gather(1, kv_idx.to(torch.int64).clamp(max=tbl_w - 1)).clamp(min=0)  # [bs, MAX_KV]
+            tokens = _row.gather(1, kv_idx.to(torch.int64).clamp(max=tbl_w - 1)).clamp(min=0).to(torch.int64)  # [bs, MAX_KV] int64 for KvGatherHM
             mask = (~valid).repeat_interleave(Hk, dim=0).unsqueeze(1)  # [bs * Hk, 1, MAX_KV] True=pad — explicit mask.
             if is_capturing:
                 self._captured_sdpa_meta = (tokens, mask)
@@ -2790,19 +2841,64 @@ class AscendAttnBackend(AttentionBackend):
         # construction above, the U8-era advanced indexing was the best-
         # verified configuration (short-text 6.2% CER). The giant one_hot
         # [bs, MAX_KV, tbl_w] is itself suspect under replay; tokens is int64.
-        k_gathered = k_cache[tokens]  # [bs, MAX_KV, Hk, D]
-        v_gathered = v_cache[tokens]  # [bs, MAX_KV, Hv, Dv]
+        #
+        # KvGatherHM fast path (custom Ascend C AIV kernel): one launch per
+        # tensor gathers the rows AND emits the head-major contiguous
+        # [bs*H, MAX_KV, D] layout the BMMs want, killing the 2x aclnnIndex
+        # and the 2 implicit aclnnBatchMatMul transpose kernels CANN fires
+        # for the non-contiguous permute(0,2,1,3).reshape() operands.
+        # Bit-identical on-device (verify_kv_gather.py), capture-safe.
+        _kv_gather = _kv_gather_hm_fn()
+        _kvg_dim_gate = int(os.environ.get("SGLANG_NPU_KVG_D", "0"))  # 0=all, 128, 256
+        if (
+            _kv_gather is not None
+            and k_cache.dtype == torch.bfloat16
+            and v_cache.dtype == torch.bfloat16
+            and D == layer.v_head_dim
+            and (D % 16) == 0
+            and k_cache.is_contiguous()
+            and v_cache.is_contiguous()
+            and tokens.dtype in (torch.int32, torch.int64)
+            and (_kvg_dim_gate == 0 or D == _kvg_dim_gate)
+            and bs <= int(os.environ.get("SGLANG_NPU_KVG_MAXBS", "0"))  # 0=off by default: production capture crashes (nondeterministic); kernel is bit-exact & passes all isolated auto-dispatch capture tests - see HANDOFF_SPEED_OPT.md sec.17
+        ):
+            _n = getattr(self, "_kv_gather_calls", 0)
+            _cap = False
+            try:
+                import torch_npu as _tn
+                _cap = bool(_tn.npu.is_current_stream_capturing())
+            except Exception:
+                pass
+            if _cap and not getattr(self, "_kv_dbg_captured", False):
+                self._kv_dbg_captured = True
+                _tmax = int(tokens.max().item()) if tokens.numel() else -1
+                print(f"[kvgather] CAPTURE bs={bs} tokens.max={_tmax} "
+                      f"pool_rows={k_cache.shape[0]}", flush=True)
+            if _n < 2 or _n % 500 == 0:
+                print(f"[kvgather] FAST path layer={layer.layer_id} bs={bs} "
+                      f"MAX_KV={MAX_KV} D={D} tokens={tuple(tokens.shape)} "
+                      f"capturing={torch.npu.is_current_stream_capturing()}", flush=True)
+            self._kv_gather_calls = _n + 1
+            _stream = int(torch.npu.current_stream().npu_stream)
+            k_bmm = _kv_gather(k_cache, tokens, _stream)  # [bs*Hk, MAX_KV, D]
+            v_bmm = _kv_gather(v_cache, tokens, _stream)  # [bs*Hv, MAX_KV, Dv]
+            k_gathered = k_bmm  # dtype reference for _qr cast below
+        else:
+            if _kv_gather is not None and getattr(self, "_kv_gather_skip", 0) < 2:
+                self._kv_gather_skip = getattr(self, "_kv_gather_skip", 0) + 1
+                print(f"[kvgather] SKIP fast path: kdt={k_cache.dtype} "
+                      f"vdt={v_cache.dtype} D={D} vdim={layer.v_head_dim} "
+                      f"kc={k_cache.is_contiguous()} vc={v_cache.is_contiguous()} "
+                      f"tdt={tokens.dtype}", flush=True)
+            k_gathered = k_cache[tokens]  # [bs, MAX_KV, Hk, D]
+            v_gathered = v_cache[tokens]  # [bs, MAX_KV, Hv, Dv]
+            k_bmm = k_gathered.permute(0, 2, 1, 3).reshape(bs * Hk, MAX_KV, D)
+            v_bmm = v_gathered.permute(0, 2, 1, 3).reshape(bs * Hv, MAX_KV, Dv)
 
-        # High-performance direct BMM for GQA/MHA decode:
-        # Replaces slow einsum("bhgqd,bhgnd->bhgqn") + unsqueeze(2) + expand(Hq)
-        # with clean hardware batched gemm (Q @ K.T) and (probs @ V).
-        # Bit-for-bit identical to the reference (max |diff| = 0.0), capture-safe,
-        # avoids SQ/CQ driver collisions, saves ~23 us per layer x 23 layers = ~0.53 ms/frame.
+        # High-performance direct BMM for GQA/MHA decode (Q @ K.T / probs @ V),
+        # bit-for-bit identical to the einsum reference, capture-safe.
         rep = Hq // Hk
         _qr = q.reshape(bs * Hk, rep, D).to(k_gathered.dtype)
-        k_bmm = k_gathered.permute(0, 2, 1, 3).reshape(bs * Hk, MAX_KV, D)
-        v_bmm = v_gathered.permute(0, 2, 1, 3).reshape(bs * Hv, MAX_KV, Dv)
-
         scores = torch.bmm(_qr, k_bmm.transpose(-1, -2)).mul_(layer.scaling)
         scores.masked_fill_(mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)

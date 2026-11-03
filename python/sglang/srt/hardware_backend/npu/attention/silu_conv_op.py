@@ -44,13 +44,17 @@ def _load():
             "/workspace/drama3-work/custom-ops",
         )
         inc = [f"{cann}/include", f"{cann}/include/aclnn"]
+        # customize2 carries BOTH SiluConvDecode4 and KvGatherHM (a merged
+        # build; the legacy "customize" vendor was taken over by another
+        # package's libcust_opapi.so at 16:56 today).
+        vend = f"{cann}/opp/vendors/customize/op_api/lib"
         ld = [
             f"-L{cann}/lib64",
             "-lascendcl",
             "-lnnopbase",
-            f"-L{cann}/opp/vendors/customize/op_api/lib",
+            f"-L{vend}",
             "-lcust_opapi",
-            f"-Wl,-rpath,{cann}/opp/vendors/customize/op_api/lib",
+            f"-Wl,--disable-new-dtags,-rpath,{vend}",
         ]
 
         # v4: takes the mamba pool and its slot indices, so the kernel does the
@@ -58,7 +62,7 @@ def _load():
         src4 = os.path.join(base, "silu_conv4_bind.cpp")
         if os.path.exists(src4):
             mod = load(
-                name="silu_conv4_ext",
+                name="silu_conv4_ext_c",
                 sources=[src4],
                 extra_include_paths=inc,
                 extra_ldflags=ld,
