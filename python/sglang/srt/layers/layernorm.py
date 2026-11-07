@@ -1370,6 +1370,10 @@ class Gemma3RMSNorm(BaseFusedOp):
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None:
             return self.forward_native(x, residual)
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
+            # aclnnGemmaRmsNorm is not supported on every Ascend SoC, so keep the
+            # same escape hatch the residual path above already honours.
+            return self.forward_native(x, residual)
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 
